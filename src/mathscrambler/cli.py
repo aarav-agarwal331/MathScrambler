@@ -6,12 +6,14 @@ no stubs (SPEC Section 8).
 
 from __future__ import annotations
 
+import logging
+
 import typer
 from rich.console import Console
 
 from mathscrambler import __version__, ollama_server, setup_flow
 from mathscrambler import doctor as doctor_mod
-from mathscrambler.config import ConfigError, load_config
+from mathscrambler.config import load_config
 
 app = typer.Typer(
     name="mathscramble",
@@ -53,12 +55,8 @@ def server_start() -> None:
     """Start the private Ollama server (idempotent)."""
     try:
         cfg = load_config()
-    except ConfigError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(1) from None
-    try:
         info = ollama_server.ensure_started(cfg)
-    except ollama_server.ServerError as e:
+    except RuntimeError as e:  # ConfigError, ServerError, port exhaustion, repo discovery
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1) from None
     verb = "started" if info.started_by_us else "already running"
@@ -70,7 +68,9 @@ def server_stop() -> None:
     """Stop the private server — refuses to signal any process it didn't start."""
     result = ollama_server.stop()
     console.print(result.reason)
-    raise typer.Exit(0 if result.stopped or "nothing to stop" in result.reason else 1)
+    # ok = the desired end state holds (no private server of ours running),
+    # even when there was nothing to signal or the record was stale.
+    raise typer.Exit(0 if result.ok else 1)
 
 
 @server_app.command("status")
@@ -85,6 +85,8 @@ def server_status() -> None:
 
 
 def main() -> None:
+    # Surface module warnings (e.g. shared-mode fallback, owned-but-wedged restarts).
+    logging.basicConfig(level=logging.WARNING, format="warning: %(message)s")
     app()
 
 

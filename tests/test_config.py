@@ -34,7 +34,8 @@ def test_fast_role_aliases_to_vision():
 def test_lite_profile_swaps_reasoner():
     cfg = load_config(EXAMPLE)
     lite = cfg.active_roles(profile="lite")
-    assert lite.resolve("reasoner").tag == "qwen3.8:27b-mlx"
+    # qwen3.6:27b-mlx, not qwen3.8: the 3.8 tag 412s on this machine's Ollama (see PLAN.md)
+    assert lite.resolve("reasoner").tag == "qwen3.6:27b-mlx"
     assert lite.resolve("fast").tag == lite.resolve("vision").tag
 
 
@@ -69,6 +70,25 @@ def test_invalid_toml_is_a_config_error(tmp_path: Path):
     bad = tmp_path / "config.toml"
     bad.write_text("profile = [unclosed")
     with pytest.raises(ConfigError, match="invalid TOML"):
+        load_config(bad)
+
+
+def test_bad_alias_rejected_at_load_time(tmp_path: Path):
+    """A typo'd alias must be a load-time ConfigError (doctor shows it red), never a
+    use-time crash halfway through a command."""
+    bad = tmp_path / "config.toml"
+    # anchor to line start: the example's comments also contain the literal string
+    bad.write_text(EXAMPLE.read_text().replace('\nfast = "vision"', '\nfast = "visoin"', 1))
+    with pytest.raises(ConfigError, match="visoin"):
+        load_config(bad)
+
+
+def test_missing_profile_table_rejected_at_load_time(tmp_path: Path):
+    bad = tmp_path / "config.toml"
+    bad.write_text(EXAMPLE.read_text().replace('profile = "default"', 'profile = "lite"').replace(
+        "[roles.lite]", "[roles.zzz]"
+    ))
+    with pytest.raises(ConfigError):
         load_config(bad)
 
 

@@ -51,6 +51,21 @@ def test_server_stop_with_nothing_running(tmp_home: Path):
     assert "nothing to stop" in result.output
 
 
+def test_server_stop_already_gone_exits_zero(monkeypatch: pytest.MonkeyPatch):
+    """Desired end state (no server) holds -> exit 0, even though nothing was signaled."""
+    gone = ollama_server.StopResult(ok=True, stopped=False, reason="server already gone; cleaned")
+    monkeypatch.setattr(cli.ollama_server, "stop", lambda: gone)
+    result = runner.invoke(app, ["server", "stop"])
+    assert result.exit_code == 0
+
+
+def test_server_stop_unstoppable_exits_nonzero(monkeypatch: pytest.MonkeyPatch):
+    stuck = ollama_server.StopResult(ok=False, stopped=False, reason="could not stop pid 1", pid=1)
+    monkeypatch.setattr(cli.ollama_server, "stop", lambda: stuck)
+    result = runner.invoke(app, ["server", "stop"])
+    assert result.exit_code == 1
+
+
 def test_server_start_reports_reuse(monkeypatch: pytest.MonkeyPatch, tmp_home: Path):
     info = ollama_server.ServerInfo(
         mode="private", base_url="http://127.0.0.1:21435", port=21435, pid=42, started_by_us=False
@@ -91,12 +106,26 @@ class _FakeResponse:
 
 
 def test_registry_size_sums_layers(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(
-        setup_flow.httpx,
-        "get",
-        lambda url, headers=None, timeout=None: _FakeResponse({"layers": [{"size": 10}, {"size": 5}]}),
-    )
+    seen: dict = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        seen["url"] = url
+        return _FakeResponse({"layers": [{"size": 10}, {"size": 5}]})
+
+    monkeypatch.setattr(setup_flow.httpx, "get", fake_get)
     assert setup_flow.registry_size("some:tag") == 15
+    assert "/v2/library/some/manifests/tag" in seen["url"]
+    assert setup_flow.registry_size("user/model:tag") == 15
+    assert "/v2/user/model/manifests/tag" in seen["url"], "namespaced tags must not get library/ prefixed"
+
+
+def test_pull_approval_gate_never_disarms_on_unknown_size():
+    """SPEC 1.4: >30 GB needs an OK — and unknown size could be >30 GB, so it asks too."""
+    assert setup_flow.needs_pull_approval(65 * 1024**3, assume_yes=False)
+    assert setup_flow.needs_pull_approval(None, assume_yes=False)
+    assert not setup_flow.needs_pull_approval(10 * 1024**3, assume_yes=False)
+    assert not setup_flow.needs_pull_approval(None, assume_yes=True)
+    assert not setup_flow.needs_pull_approval(65 * 1024**3, assume_yes=True)
 
 
 def test_registry_size_handles_404(monkeypatch: pytest.MonkeyPatch):
@@ -108,19 +137,31 @@ def test_registry_size_handles_404(monkeypatch: pytest.MonkeyPatch):
     assert setup_flow.registry_size("glm-5.3-flash") is None
 
 
-def test_vendor_katex_skips_when_present(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_vendor_katex_skips_only_when_complete(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     target = tmp_path / "katex"
     target.mkdir()
-    (target / "katex.min.css").write_text("/* css */")
     monkeypatch.setattr(setup_flow, "katex_dir", lambda: target)
+    network_hits: list = []
 
-    def boom(*a, **k):
-        raise AssertionError("must not hit the network when already vendored")
+    def fake_get(*a, **k):
+        network_hits.append(a)
+        raise setup_flow.httpx.ConnectError("offline")
 
-    monkeypatch.setattr(setup_flow.httpx, "get", boom)
+    monkeypatch.setattr(setup_flow.httpx, "get", fake_get)
     from rich.console import Console
 
+    # Partial previous attempt (css only): must RE-vendor, not skip.
+    (target / "katex.min.css").write_text("/* css */")
     setup_flow.vendor_katex(Console(record=True))
+    assert network_hits, "a partial vendor must be re-attempted"
+
+    # Complete install: must skip without touching the network.
+    for name in ("katex.min.js", "auto-render.min.js"):
+        (target / name).write_text("js")
+    (target / "fonts").mkdir()
+    network_hits.clear()
+    setup_flow.vendor_katex(Console(record=True))
+    assert not network_hits, "a complete vendor must not hit the network"
 
 
 def test_doctor_run_checks_smoke(tmp_home: Path, monkeypatch: pytest.MonkeyPatch):

@@ -11,7 +11,7 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from mathscrambler import paths
 
@@ -118,6 +118,20 @@ class Config(BaseModel):
     sandbox: SandboxConfig = SandboxConfig()
     memory: MemoryConfig = MemoryConfig()
     bench: BenchConfig = BenchConfig()
+
+    @model_validator(mode="after")
+    def _validate_profiles(self) -> Config:
+        """Fail at load time, not at use time — doctor must report a bad alias as a
+        red config check, never crash with a traceback halfway through a command."""
+        if self.profile not in self.roles:
+            raise ValueError(f"profile {self.profile!r} has no [roles.{self.profile}] table")
+        for name, table in self.roles.items():
+            for role in ROLES:
+                try:
+                    table.resolve(role)
+                except ConfigError as e:
+                    raise ValueError(f"roles.{name}.{role}: {e}") from e
+        return self
 
     def active_roles(
         self,

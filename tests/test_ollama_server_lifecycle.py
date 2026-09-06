@@ -76,6 +76,16 @@ def test_scoped_env_inherits_preexisting_ollama_models(cfg, monkeypatch: pytest.
     assert env["OLLAMA_MODELS"] == "/custom/store", "a user-exported store location is inherited untouched"
 
 
+def test_scoped_env_strips_foreign_ollama_vars(cfg, monkeypatch: pytest.MonkeyPatch):
+    """A launchctl-injected OLLAMA_* var must not reconfigure OUR server."""
+    monkeypatch.setenv("OLLAMA_CONTEXT_LENGTH", "2048")
+    monkeypatch.setenv("OLLAMA_DEBUG", "1")
+    env = scoped_env(21435, cfg)
+    assert "OLLAMA_CONTEXT_LENGTH" not in env
+    assert "OLLAMA_DEBUG" not in env
+    assert env["OLLAMA_MAX_LOADED_MODELS"] == "3"
+
+
 # --------------------------------------------------------------------- PID file
 
 
@@ -146,6 +156,47 @@ def test_ensure_started_reuses_healthy_server(tmp_home: Path, cfg, monkeypatch: 
     assert spawned == []
 
 
+def test_ensure_started_stops_owned_wedged_server_before_respawn(
+    tmp_home: Path, cfg, monkeypatch: pytest.MonkeyPatch
+):
+    """An owned-but-unhealthy server must be STOPPED, never orphaned by a bare
+    PID-file unlink followed by a duplicate spawn (Phase-1 review, high)."""
+    old = _record(pid=4242, port=21435)
+    write_pid_record(old)
+    monkeypatch.setattr(ollama_server, "owns_process", lambda r: True)
+    monkeypatch.setattr(ollama_server, "_probe_owned_server", lambda r: False)
+    terminated: list = []
+    monkeypatch.setattr(
+        ollama_server, "_terminate_group", lambda pid, term_wait_s: terminated.append(pid) or True
+    )
+    monkeypatch.setattr(
+        ollama_server, "discover_binary", lambda: BinaryInfo(Path("/fake/ollama"), "0.30.10")
+    )
+    monkeypatch.setattr(ollama_server.sysinfo, "find_free_port", lambda start, max_tries=20: start)
+
+    def fake_spawn(binary, port, config, health_timeout_s, poll_interval_s):
+        new = _record(pid=777, port=port)
+        write_pid_record(new)
+        return new
+
+    monkeypatch.setattr(ollama_server, "_spawn", fake_spawn)
+    info = ollama_server.ensure_started(cfg)
+    assert terminated == [4242], "the owned wedged server must be terminated before respawning"
+    assert info.pid == 777
+
+
+def test_ensure_started_raises_if_owned_wedged_server_unstoppable(
+    tmp_home: Path, cfg, monkeypatch: pytest.MonkeyPatch
+):
+    write_pid_record(_record(pid=4242))
+    monkeypatch.setattr(ollama_server, "owns_process", lambda r: True)
+    monkeypatch.setattr(ollama_server, "_probe_owned_server", lambda r: False)
+    monkeypatch.setattr(ollama_server, "_terminate_group", lambda pid, term_wait_s: False)
+    with pytest.raises(ServerError, match="wedged"):
+        ollama_server.ensure_started(cfg)
+    assert read_pid_record() is not None, "the record of a live owned process must be kept"
+
+
 def test_ensure_started_cleans_stale_and_spawns_on_walked_port(
     tmp_home: Path, cfg, monkeypatch: pytest.MonkeyPatch
 ):
@@ -195,26 +246,75 @@ class FakeProc:
         self.terminated = True
 
 
-def test_spawn_raises_with_log_tail_when_child_dies(tmp_home: Path, cfg, monkeypatch: pytest.MonkeyPatch):
+def test_spawn_raises_with_this_runs_log_when_child_dies(
+    tmp_home: Path, cfg, monkeypatch: pytest.MonkeyPatch
+):
     paths.ensure_app_dirs()
-    paths.ollama_log_path().write_text("boot\nError: listen tcp 127.0.0.1:11435: address already in use\n")
-    monkeypatch.setattr(
-        ollama_server.subprocess, "Popen", lambda *a, **k: FakeProc(returncode=1)
-    )
+    # A PREVIOUS session's bind failure sits in the append-mode log...
+    paths.ollama_log_path().write_text("Error: listen tcp: bind: address already in use (STALE)\n")
+
+    def fake_popen(cmd, env, stdout, stderr, cwd, start_new_session):
+        stdout.write("Error: something else entirely went wrong\n")
+        stdout.flush()
+        return FakeProc(returncode=1)
+
+    monkeypatch.setattr(ollama_server.subprocess, "Popen", fake_popen)
+    binary = BinaryInfo(Path("/fake/ollama"), "0.30.10")
+    with pytest.raises(ServerError) as exc:
+        ollama_server._spawn(binary, 21435, cfg, health_timeout_s=1.0, poll_interval_s=0.01)
+    # ...and must NOT leak into this run's error (it would misclassify the failure
+    # as a bind race and trigger a bogus port-walk retry).
+    assert "something else entirely" in str(exc.value)
+    assert "STALE" not in str(exc.value)
+
+
+def test_spawn_bind_race_error_carries_this_runs_bind_line(
+    tmp_home: Path, cfg, monkeypatch: pytest.MonkeyPatch
+):
+    paths.ensure_app_dirs()
+
+    def fake_popen(cmd, env, stdout, stderr, cwd, start_new_session):
+        stdout.write("Error: listen tcp 127.0.0.1:21435: bind: address already in use\n")
+        stdout.flush()
+        return FakeProc(returncode=1)
+
+    monkeypatch.setattr(ollama_server.subprocess, "Popen", fake_popen)
     binary = BinaryInfo(Path("/fake/ollama"), "0.30.10")
     with pytest.raises(ServerError, match="address already in use"):
         ollama_server._spawn(binary, 21435, cfg, health_timeout_s=1.0, poll_interval_s=0.01)
 
 
-def test_spawn_times_out_and_terminates_child(tmp_home: Path, cfg, monkeypatch: pytest.MonkeyPatch):
+def test_spawn_times_out_and_reaps_child(tmp_home: Path, cfg, monkeypatch: pytest.MonkeyPatch):
     paths.ensure_app_dirs()
     proc = FakeProc(returncode=None)
     monkeypatch.setattr(ollama_server.subprocess, "Popen", lambda *a, **k: proc)
     monkeypatch.setattr(ollama_server, "api_version", lambda port, timeout=2.0: None)
+    reaped: list = []
+    monkeypatch.setattr(
+        ollama_server, "_terminate_group", lambda pid, term_wait_s: reaped.append(pid) or True
+    )
     binary = BinaryInfo(Path("/fake/ollama"), "0.30.10")
     with pytest.raises(ServerError, match="did not answer"):
         ollama_server._spawn(binary, 21435, cfg, health_timeout_s=0.2, poll_interval_s=0.01)
-    assert proc.terminated
+    assert reaped == [proc.pid], "a health-timeout child must be killed via its process group"
+
+
+def test_spawn_rejects_foreign_responder(tmp_home: Path, cfg, monkeypatch: pytest.MonkeyPatch):
+    """Port answers but our child died: a foreign process won the bind race —
+    it must never be adopted as ours."""
+    paths.ensure_app_dirs()
+    proc = FakeProc(returncode=None)
+    monkeypatch.setattr(ollama_server.subprocess, "Popen", lambda *a, **k: proc)
+
+    def version_then_dead(port, timeout=2.0):
+        proc.returncode = 1  # child dies exactly as something else answers
+        return "9.9.9"
+
+    monkeypatch.setattr(ollama_server, "api_version", version_then_dead)
+    binary = BinaryInfo(Path("/fake/ollama"), "0.30.10")
+    with pytest.raises(ServerError, match="foreign process"):
+        ollama_server._spawn(binary, 21435, cfg, health_timeout_s=1.0, poll_interval_s=0.01)
+    assert read_pid_record() is None
 
 
 def test_spawn_records_scoped_env_and_pid(tmp_home: Path, cfg, monkeypatch: pytest.MonkeyPatch):
@@ -260,6 +360,7 @@ def test_stop_refuses_unowned_pid(tmp_home: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(ollama_server.os, "killpg", lambda *a: kills.append(a))
     result = ollama_server.stop()
     assert not result.stopped
+    assert result.ok, "end state (no server of ours) holds, so ok must be True"
     assert "refusing to signal" in result.reason
     assert kills == []
     assert read_pid_record() is None  # stale file cleaned
@@ -273,9 +374,33 @@ def test_stop_terminates_owned_process(tmp_home: Path, monkeypatch: pytest.Monke
     monkeypatch.setattr(ollama_server.psutil, "pid_exists", lambda pid: False)
     result = ollama_server.stop()
     assert result.stopped
+    assert result.ok
     assert result.pid == 54321
     assert kills == [(54321, ollama_server.signal.SIGTERM)]
     assert read_pid_record() is None
+
+
+def test_stop_when_process_already_gone_is_ok(tmp_home: Path, monkeypatch: pytest.MonkeyPatch):
+    """A server that died on its own: nothing to signal, but the end state holds."""
+    write_pid_record(_record(pid=54321))
+    monkeypatch.setattr(ollama_server, "owns_process", lambda r: True)
+
+    def killpg_gone(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(ollama_server.os, "killpg", killpg_gone)
+    result = ollama_server.stop()
+    assert result.ok
+    assert read_pid_record() is None
+
+
+def test_stop_unstoppable_process_is_not_ok(tmp_home: Path, monkeypatch: pytest.MonkeyPatch):
+    write_pid_record(_record(pid=54321))
+    monkeypatch.setattr(ollama_server, "owns_process", lambda r: True)
+    monkeypatch.setattr(ollama_server, "_terminate_group", lambda pid, term_wait_s: False)
+    result = ollama_server.stop()
+    assert not result.ok
+    assert read_pid_record() is not None, "keep the record of a process we could not stop"
 
 
 # --------------------------------------------------------------------- probes over stub
@@ -289,6 +414,14 @@ def test_api_probes_against_stub(http_stub):
     assert ollama_server.api_ps(http_stub.port) == [{"name": "tiny:1b", "size": 1}]
     assert ollama_server.api_tags(http_stub.port) == [{"name": "tiny:1b", "size": 1}]
     assert ollama_server.api_version(1) is None  # nothing listens on port 1
+
+
+def test_api_probes_reject_garbled_responders(http_stub):
+    """A foreign, non-Ollama listener must never pass a health check."""
+    http_stub.route("/api/version", {})  # 200 but no version key
+    http_stub.route("/api/ps", {"models": "not-a-list"})
+    assert ollama_server.api_version(http_stub.port) is None
+    assert ollama_server.api_ps(http_stub.port) is None
 
 
 # --------------------------------------------------------------------- pull guard

@@ -87,7 +87,8 @@ def _check_global_server(cfg: Config | None) -> Check:
         return Check(
             "global server (informational)",
             Level.YELLOW,
-            f"no server on 127.0.0.1:{port} — fine; MathScrambler uses its own private server",
+            f"no server on 127.0.0.1:{port} — fine; MathScrambler uses its own private server; "
+            f"launchctl OLLAMA_MAX_LOADED_MODELS: {launchctl_value} (untouched by MathScrambler)",
         )
     residents = ollama_server.api_ps(port) or []
     names = ", ".join(m.get("name", "?") for m in residents) or "none"
@@ -260,15 +261,31 @@ def _uv_tool_bin_dir() -> Path:
 
 
 def _check_shim() -> Check:
-    if shutil.which("mathscramble"):
-        return Check("uv tool shim", Level.GREEN, f"`mathscramble` on PATH ({shutil.which('mathscramble')})")
-    bin_dir = _uv_tool_bin_dir()
-    return Check(
-        "uv tool shim",
-        Level.RED,
-        f"`mathscramble` not on PATH (shim dir: {bin_dir})",
-        fix=f'add to your shell profile yourself: export PATH="{bin_dir}:$PATH"',
-    )
+    """Both console scripts must resolve: `mathscramble` AND the `ms` alias (SPEC Section 0)."""
+    main_shim = shutil.which("mathscramble")
+    if not main_shim:
+        bin_dir = _uv_tool_bin_dir()
+        return Check(
+            "uv tool shim",
+            Level.RED,
+            f"`mathscramble` not on PATH (shim dir: {bin_dir})",
+            fix=f'add to your shell profile yourself: export PATH="{bin_dir}:$PATH"',
+        )
+    ms_shim = shutil.which("ms")
+    if not ms_shim:
+        return Check(
+            "uv tool shim",
+            Level.RED,
+            f"`mathscramble` on PATH ({main_shim}) but the `ms` alias is missing",
+            fix="uv tool install -e . --reinstall",
+        )
+    if "mathscrambler" not in str(Path(ms_shim).resolve()):
+        return Check(
+            "uv tool shim",
+            Level.YELLOW,
+            f"`ms` on PATH resolves to a different tool ({ms_shim}) — use `mathscramble` instead",
+        )
+    return Check("uv tool shim", Level.GREEN, f"`mathscramble` and `ms` on PATH ({main_shim})")
 
 
 def run_checks() -> list[Check]:

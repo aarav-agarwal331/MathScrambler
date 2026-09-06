@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import re
 import shutil
@@ -30,11 +31,16 @@ import psutil
 from mathscrambler import paths, sysinfo
 from mathscrambler.config import Config
 
+log = logging.getLogger("mathscrambler.ollama_server")
+
 MIN_OLLAMA_VERSION = (0, 19)
 APP_BUNDLE_BINARY = Path("/Applications/Ollama.app/Contents/Resources/ollama")
 PORT_WALK_TRIES = 20
 LOG_ROTATE_BYTES = 10 * 1024 * 1024
 CREATE_TIME_TOLERANCE_S = 1.0
+SPAWN_MARKER = "--- mathscramble spawn "
+OWNED_PROBE_RETRIES = 4  # extra health probes before declaring an owned server wedged
+SHARED_PROBE_TTL_S = 24 * 3600
 
 
 class ServerError(RuntimeError):
@@ -97,13 +103,17 @@ def _parse_version_output(text: str) -> str | None:
 
 
 def scoped_env(port: int, config: Config) -> dict[str, str]:
-    """Full environment copy overlaid with exactly the private server's settings.
+    """Full environment copy, foreign OLLAMA_* stripped, our settings overlaid.
 
     A full copy (not a minimal env) because ollama needs HOME to find the shared
-    model store and PATH/TMPDIR for its runners. OLLAMA_MODELS is never set or
-    unset here — the store stays wherever the user's already is (Section 1.2).
+    model store and PATH/TMPDIR for its runners. Any globally-injected OLLAMA_*
+    (e.g. via launchctl setenv) is stripped so it cannot reconfigure OUR server —
+    except OLLAMA_MODELS, which is deliberately inherited untouched so the store
+    stays wherever the user's already is (Section 1.2). We never set it.
     """
-    env = dict(os.environ)
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith("OLLAMA_") or k == "OLLAMA_MODELS"
+    }
     env.update(
         {
             "OLLAMA_HOST": f"127.0.0.1:{port}",
@@ -175,33 +185,43 @@ def owns_process(record: PidRecord) -> bool:
 
 # --------------------------------------------------------------------------- HTTP probes
 
+# Loopback probes must never route through a user proxy (HTTP_PROXY et al.).
+_NO_PROXY_CLIENT_KW = {"trust_env": False}
 
-def api_version(port: int, timeout: float = 2.0) -> str | None:
+
+def _get_json_dict(url: str, timeout: float) -> dict | None:
     try:
-        resp = httpx.get(f"http://127.0.0.1:{port}/api/version", timeout=timeout)
+        resp = httpx.get(url, timeout=timeout, **_NO_PROXY_CLIENT_KW)
         resp.raise_for_status()
-        return str(resp.json().get("version"))
+        data = resp.json()
     except (httpx.HTTPError, ValueError):
         return None
+    return data if isinstance(data, dict) else None
+
+
+def api_version(port: int, timeout: float = 2.0) -> str | None:
+    data = _get_json_dict(f"http://127.0.0.1:{port}/api/version", timeout)
+    if data is None:
+        return None
+    version = data.get("version")
+    return str(version) if version else None
+
+
+def _models_list(port: int, endpoint: str, timeout: float) -> list[dict] | None:
+    data = _get_json_dict(f"http://127.0.0.1:{port}/api/{endpoint}", timeout)
+    if data is None:
+        return None
+    models = data.get("models", [])
+    return [m for m in models if isinstance(m, dict)] if isinstance(models, list) else None
 
 
 def api_ps(port: int, timeout: float = 3.0) -> list[dict] | None:
-    """Resident models on a server, or None if unreachable."""
-    try:
-        resp = httpx.get(f"http://127.0.0.1:{port}/api/ps", timeout=timeout)
-        resp.raise_for_status()
-        return list(resp.json().get("models", []))
-    except (httpx.HTTPError, ValueError):
-        return None
+    """Resident models on a server, or None if unreachable/garbled (NOT the same as idle!)."""
+    return _models_list(port, "ps", timeout)
 
 
 def api_tags(port: int, timeout: float = 5.0) -> list[dict] | None:
-    try:
-        resp = httpx.get(f"http://127.0.0.1:{port}/api/tags", timeout=timeout)
-        resp.raise_for_status()
-        return list(resp.json().get("models", []))
-    except (httpx.HTTPError, ValueError):
-        return None
+    return _models_list(port, "tags", timeout)
 
 
 def pull_in_progress(store: Path | None = None, settle_s: float = 3.0) -> str | None:
@@ -216,7 +236,12 @@ def pull_in_progress(store: Path | None = None, settle_s: float = 3.0) -> str | 
     partials = list(blobs.glob("*-partial*"))
     if not partials:
         return None
-    sizes = {p: p.stat().st_size for p in partials if p.exists()}
+    sizes: dict[Path, int] = {}
+    for p in partials:
+        with suppress(FileNotFoundError):  # completed/renamed between glob and stat
+            sizes[p] = p.stat().st_size
+    if not sizes:
+        return None
     time.sleep(settle_s)
     for p, size in sizes.items():
         try:
@@ -224,7 +249,27 @@ def pull_in_progress(store: Path | None = None, settle_s: float = 3.0) -> str | 
                 return f"a pull is in progress in the shared model store ({p.name} is growing)"
         except FileNotFoundError:
             continue  # completed between stats
-    return f"{len(partials)} partial blob(s) in the shared store (a stalled or in-flight pull); retry later"
+    return f"{len(sizes)} partial blob(s) in the shared store (a stalled or in-flight pull); retry later"
+
+
+# --------------------------------------------------------------------------- state file
+
+
+def _read_state() -> dict:
+    try:
+        data = json.loads(paths.state_file_path().read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_state(update: dict) -> None:
+    state = _read_state()
+    state.update(update)
+    path = paths.state_file_path()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.rename(tmp, path)
 
 
 # --------------------------------------------------------------------------- lifecycle
@@ -260,11 +305,41 @@ def _rotate_log(log_path: Path) -> None:
         pass
 
 
-def _tail(path: Path, lines: int = 20) -> str:
+def _tail_this_spawn(path: Path, lines: int = 20) -> str:
+    """Last lines of the server log, scoped to the MOST RECENT spawn marker.
+
+    Scoping matters: the log is append-mode, so an unscoped tail can surface a
+    PREVIOUS run's error lines (e.g. an old bind failure) and misclassify this
+    run's failure.
+    """
     try:
-        return "\n".join(path.read_text(errors="replace").splitlines()[-lines:])
+        all_lines = path.read_text(errors="replace").splitlines()
     except OSError:
         return "(no server log available)"
+    start = 0
+    for i, line in enumerate(all_lines):
+        if line.startswith(SPAWN_MARKER):
+            start = i + 1
+    return "\n".join(all_lines[start:][-lines:])
+
+
+def _terminate_group(pid: int, term_wait_s: float) -> bool:
+    """SIGTERM the process group, wait, escalate to SIGKILL. True if it's gone."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    deadline = time.monotonic() + term_wait_s
+    while time.monotonic() < deadline:
+        if not psutil.pid_exists(pid):
+            return True
+        time.sleep(0.1)
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, signal.SIGKILL)
+    time.sleep(0.2)
+    return not psutil.pid_exists(pid)
 
 
 def _spawn(
@@ -276,13 +351,14 @@ def _spawn(
 ) -> PidRecord:
     log_path = paths.ollama_log_path()
     _rotate_log(log_path)
-    overlay = {k: v for k, v in scoped_env(port, config).items() if k in SCOPED_ENV_KEYS}
+    env = scoped_env(port, config)
+    overlay = {k: env[k] for k in SCOPED_ENV_KEYS}
     with open(log_path, "a") as log_fh:
-        log_fh.write(f"\n--- mathscramble spawn {datetime.now(UTC).isoformat()} port={port} ---\n")
+        log_fh.write(f"\n{SPAWN_MARKER}{datetime.now(UTC).isoformat()} port={port} ---\n")
         log_fh.flush()
         proc = subprocess.Popen(
             [str(binary.path), "serve"],
-            env=scoped_env(port, config),
+            env=env,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             cwd=paths.app_support_dir(),
@@ -293,16 +369,25 @@ def _spawn(
         if proc.poll() is not None:
             raise ServerError(
                 f"private ollama server exited during startup (code {proc.returncode}); "
-                f"last log lines from {log_path}:\n{_tail(log_path)}"
+                f"log lines from this attempt ({log_path}):\n{_tail_this_spawn(log_path)}"
             )
         if api_version(port, timeout=1.0):
             break
         time.sleep(poll_interval_s)
     else:
-        proc.terminate()
+        reaped = _terminate_group(proc.pid, term_wait_s=5.0)
+        leak_note = "" if reaped else f" WARNING: pid {proc.pid} survived SIGKILL — check it manually."
         raise ServerError(
             f"private ollama server did not answer /api/version on port {port} "
-            f"within {health_timeout_s:.0f}s; last log lines:\n{_tail(log_path)}"
+            f"within {health_timeout_s:.0f}s; log lines from this attempt:\n"
+            f"{_tail_this_spawn(log_path)}{leak_note}"
+        )
+    if proc.poll() is not None:
+        # Something answered the port but our child is dead — a foreign process
+        # won the bind race. Never adopt a process we didn't start.
+        raise ServerError(
+            f"port {port} is answering but our spawned server exited (code {proc.returncode}) — "
+            f"a foreign process holds the port; log:\n{_tail_this_spawn(log_path)}"
         )
     try:
         create_time = psutil.Process(proc.pid).create_time()
@@ -321,29 +406,62 @@ def _spawn(
     return record
 
 
+def _probe_owned_server(record: PidRecord, retries: int = OWNED_PROBE_RETRIES) -> bool:
+    """Health-probe a server we own, with patience: one transient timeout must not
+    condemn a live process (it may be scanning the store or paging under load)."""
+    for attempt in range(retries):
+        if api_version(record.port, timeout=2.0 + attempt):
+            return True
+        if not owns_process(record):
+            return False
+        time.sleep(0.5)
+    return False
+
+
 def ensure_started(
     config: Config,
     health_timeout_s: float = 30.0,
     poll_interval_s: float = 0.25,
 ) -> ServerInfo:
     """Start (or reuse) the server the engine should talk to. Idempotent; flock-guarded."""
-    if config.ollama.mode == "shared":
-        shared = _try_shared_mode(config)
-        if shared is not None:
-            return shared
-        # fall through to private with a spawned server
     with _server_lock():
+        if config.ollama.mode == "shared":
+            shared = _try_shared_mode(config)
+            if shared is not None:
+                return shared
+            log.warning(
+                "config asks for shared mode but the global server on %d is unavailable, busy, "
+                "or unverified — falling back to a private server",
+                config.ollama.global_port,
+            )
         record = read_pid_record()
         if record is not None:
-            if owns_process(record) and api_version(record.port):
-                return ServerInfo(
-                    mode="private",
-                    base_url=f"http://127.0.0.1:{record.port}",
-                    port=record.port,
-                    pid=record.pid,
-                    started_by_us=False,
+            if owns_process(record):
+                if _probe_owned_server(record):
+                    return ServerInfo(
+                        mode="private",
+                        base_url=f"http://127.0.0.1:{record.port}",
+                        port=record.port,
+                        pid=record.pid,
+                        started_by_us=False,
+                    )
+                # Owned but wedged: stop the process we own before replacing it.
+                # Never just unlink the record — that would orphan our own server.
+                log.warning(
+                    "private server pid %d is alive but not answering on port %d — stopping it "
+                    "before starting a fresh one",
+                    record.pid,
+                    record.port,
                 )
-            paths.pid_file_path().unlink(missing_ok=True)  # stale: clean, never signal
+                if not _terminate_group(record.pid, term_wait_s=10.0):
+                    raise ServerError(
+                        f"private server pid {record.pid} is wedged and could not be stopped; "
+                        f"inspect it manually before starting another (`ps -p {record.pid}`)"
+                    )
+                paths.pid_file_path().unlink(missing_ok=True)
+            else:
+                # Provably not our process (or gone): the record is stale. Clean, never signal.
+                paths.pid_file_path().unlink(missing_ok=True)
 
         binary = discover_binary()
         if binary.version_tuple < MIN_OLLAMA_VERSION:
@@ -351,14 +469,21 @@ def ensure_started(
                 f"ollama {binary.version} at {binary.path} is older than required "
                 f"{'.'.join(map(str, MIN_OLLAMA_VERSION))}; upgrade with `brew upgrade ollama`"
             )
-        port = sysinfo.find_free_port(config.ollama.port, max_tries=PORT_WALK_TRIES)
+        try:
+            port = sysinfo.find_free_port(config.ollama.port, max_tries=PORT_WALK_TRIES)
+        except RuntimeError as e:
+            raise ServerError(str(e)) from e
         try:
             record = _spawn(binary, port, config, health_timeout_s, poll_interval_s)
         except ServerError as first_error:
+            # The error's log tail is scoped to THIS spawn attempt (see _tail_this_spawn),
+            # so this match cannot be triggered by a previous run's stale bind failure.
             if "address already in use" not in str(first_error):
                 raise
-            # lost a bind race with a foreign process: walk once more
-            port = sysinfo.find_free_port(port + 1, max_tries=PORT_WALK_TRIES)
+            try:
+                port = sysinfo.find_free_port(port + 1, max_tries=PORT_WALK_TRIES)
+            except RuntimeError as e:
+                raise ServerError(str(e)) from e
             record = _spawn(binary, port, config, health_timeout_s, poll_interval_s)
         return ServerInfo(
             mode="private",
@@ -372,17 +497,39 @@ def ensure_started(
 def _try_shared_mode(config: Config) -> ServerInfo | None:
     """Reuse the global server only when provably friendly (Section 1.2).
 
-    The spec's probe loads two tiny models on the global server — but on a
-    limit-1 server that would itself evict a resident model, violating "never
-    evict another server's models". So the probe only runs when the global
-    server is idle; otherwise we warn and fall back to private.
+    Etiquette layered on top of the spec's probe, because the probe itself must
+    never evict a neighbor's model:
+    - a successful probe is cached in state.json (TTL 24h) so we don't reload
+      probe models on every invocation — and so our own residents on the global
+      server don't read as "busy" on the next run;
+    - the probe only runs while the global server is verifiably idle, re-checked
+      immediately before EACH load, and aborts the moment a foreign model appears;
+    - an unreachable /api/ps means residency is UNKNOWN — treated as busy, not idle;
+    - probe loads use keep_alive=0 so they unload immediately.
+    A remaining sliver of check-vs-load race is unavoidable without a reservation
+    API; the re-check-per-load plus tiny (<=2 GB) models keeps the worst case to
+    evicting nothing warm (we only proceed from a verified-idle server).
     """
     port = config.ollama.global_port
-    if api_version(port) is None:
+    version = api_version(port)
+    if version is None:
         return None
-    residents = api_ps(port) or []
-    if residents:
-        return None  # cannot probe without risking eviction; caller falls back to private
+
+    state = _read_state()
+    verified_at = state.get("shared_verified_at")
+    if verified_at:
+        try:
+            age = (datetime.now(UTC) - datetime.fromisoformat(verified_at)).total_seconds()
+        except ValueError:
+            age = SHARED_PROBE_TTL_S + 1
+        if age < SHARED_PROBE_TTL_S:
+            return ServerInfo(
+                mode="shared", base_url=f"http://127.0.0.1:{port}", port=port, pid=None, started_by_us=False
+            )
+
+    residents = api_ps(port)
+    if residents is None or residents:  # unknown counts as busy
+        return None
     tags = api_tags(port) or []
     small = sorted(
         (m for m in tags if 0 < int(m.get("size", 0)) <= 2 * 1024**3),
@@ -390,17 +537,24 @@ def _try_shared_mode(config: Config) -> ServerInfo | None:
     )[:2]
     if len(small) < 2:
         return None
+    probe_names = {m["name"] for m in small}
     try:
         for model in small:
+            now_resident = api_ps(port)
+            if now_resident is None or any(m.get("name") not in probe_names for m in now_resident):
+                log.warning("global server became busy mid-probe — aborting shared-mode probe")
+                return None
             httpx.post(
                 f"http://127.0.0.1:{port}/api/generate",
-                json={"model": model["name"], "keep_alive": "10s"},
+                json={"model": model["name"], "keep_alive": 0},
                 timeout=120,
+                **_NO_PROXY_CLIENT_KW,
             ).raise_for_status()
         loaded = api_ps(port) or []
     except httpx.HTTPError:
         return None
     if len(loaded) >= 2:
+        _write_state({"shared_verified_at": datetime.now(UTC).isoformat(), "shared_version": version})
         return ServerInfo(
             mode="shared", base_url=f"http://127.0.0.1:{port}", port=port, pid=None, started_by_us=False
         )
@@ -409,7 +563,8 @@ def _try_shared_mode(config: Config) -> ServerInfo | None:
 
 @dataclass(frozen=True)
 class StopResult:
-    stopped: bool
+    ok: bool  # the desired end state holds: no private server of ours is running
+    stopped: bool  # we actually terminated a process
     reason: str
     pid: int | None = None
 
@@ -419,35 +574,29 @@ def stop(term_wait_s: float = 10.0) -> StopResult:
     with _server_lock():
         record = read_pid_record()
         if record is None:
-            return StopResult(stopped=False, reason="no private server PID file — nothing to stop")
+            return StopResult(ok=True, stopped=False, reason="no private server PID file — nothing to stop")
         if not owns_process(record):
             paths.pid_file_path().unlink(missing_ok=True)
             return StopResult(
+                ok=True,
                 stopped=False,
                 reason=(
                     f"PID {record.pid} is not the server this tool started "
                     "(stale or recycled PID) — refusing to signal it; cleaned the stale PID file"
                 ),
             )
-        try:
-            os.killpg(record.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            paths.pid_file_path().unlink(missing_ok=True)
-            return StopResult(stopped=False, reason="server already gone; cleaned the PID file")
-        except PermissionError:
+        gone = _terminate_group(record.pid, term_wait_s)
+        if not gone:
             return StopResult(
-                stopped=False, reason=f"no permission to signal PID {record.pid} — refusing"
+                ok=False,
+                stopped=False,
+                reason=f"could not stop private server pid {record.pid} (no permission or wedged)",
+                pid=record.pid,
             )
-        deadline = time.monotonic() + term_wait_s
-        while time.monotonic() < deadline:
-            if not psutil.pid_exists(record.pid):
-                break
-            time.sleep(0.1)
-        else:
-            with suppress(ProcessLookupError, PermissionError):
-                os.killpg(record.pid, signal.SIGKILL)
         paths.pid_file_path().unlink(missing_ok=True)
-        return StopResult(stopped=True, reason=f"stopped private server (pid {record.pid})", pid=record.pid)
+        return StopResult(
+            ok=True, stopped=True, reason=f"stopped private server (pid {record.pid})", pid=record.pid
+        )
 
 
 @dataclass(frozen=True)
