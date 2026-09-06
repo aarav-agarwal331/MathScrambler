@@ -1,0 +1,14 @@
+# local state
+config.toml
+outputs/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.DS_Store
+# vendored at setup time (large binary assets, re-fetchable)
+src/mathscrambler/web/static/katex/

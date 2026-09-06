@@ -1,0 +1,98 @@
+# MathScrambler configuration.
+# `mathscramble setup` copies this file to config.toml (gitignored) if it doesn't exist.
+# Models are configured HERE and only here — swap any role by editing one `tag` line.
+
+schema_version = 1
+
+# Active role profile: "default" or "lite" (also switchable per command with --lite).
+profile = "default"
+
+[ollama]
+# "private": MathScrambler spawns its own `ollama serve` on `port` with scoped env vars
+#            (never touching the global server on `global_port`). This is the default.
+# "shared":  reuse the global server — only honored if a probe shows it keeps >= 2 models
+#            resident, and the probe itself only runs while the global server is idle.
+mode = "private"
+port = 11435
+global_port = 11434
+keep_alive = "30m"
+max_loaded_models = 3
+
+[dashboard]
+port = 8765
+open_browser = true
+
+# ---------------------------------------------------------------------------
+# Role profiles. Each role is either a table with a `tag`, or a string naming
+# another role to alias (e.g. fast = "vision" reuses the vision model).
+# ---------------------------------------------------------------------------
+
+# `fast` reuses the vision model by default: three separate resident models
+# (~107 GB of weights) would exceed the Metal wired-memory ceiling on a 128 GB
+# machine. To use a dedicated fast model instead, replace `fast = "vision"`
+# with a table:
+#   [roles.default.fast]
+#   tag = "qwen3.8:27b-mlx"
+#   num_ctx = 8192
+#   temperature = 0.4
+#   think = false
+[roles.default]
+fast = "vision"
+
+[roles.default.vision]
+tag = "qwen3.6:35b-mlx"
+num_ctx = 8192
+temperature = 0.0
+think = false
+
+[roles.default.reasoner]
+tag = "gpt-oss:120b"
+num_ctx = 16384
+temperature = 0.3
+reasoning_effort = "high"
+
+[roles.lite]
+fast = "vision"
+
+[roles.lite.vision]
+tag = "qwen3.6:35b-mlx"
+num_ctx = 8192
+temperature = 0.0
+think = false
+
+[roles.lite.reasoner]
+tag = "qwen3.8:27b-mlx"
+num_ctx = 16384
+temperature = 0.3
+think = true
+
+[sampling]
+max_samples = 2000
+relaxed_extra_samples = 1000
+keep_nice_answers = true
+reject_degenerate = true
+blueprint_max_retries = 3
+verify_max_retries = 3
+
+[sandbox]
+timeout_s = 5.0
+memory_mb = 1024
+
+[memory]
+# Refuse to load models if projected usage would push the machine past this
+# fraction of physical memory (Section 1.2 "memory etiquette").
+max_fraction = 0.85
+
+[bench]
+n_variants = 2
+# Candidate reasoner tags `mathscramble bench` compares out of the box.
+# Un-pulled tags are skipped with their pull size shown; tags that don't exist
+# in the registry (glm-5.3-flash currently 404s) are reported, never fatal.
+candidates = [
+    "gpt-oss:120b",
+    "qwen3.5:122b",
+    "qwen3.8:27b-mlx",
+    "qwen3.6:35b-mlx",
+    "glm-5.3-flash",
+    "gemma4",
+]
