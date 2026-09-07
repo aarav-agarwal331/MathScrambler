@@ -40,6 +40,8 @@ _DIRECTIVE_RE = re.compile(
     r"^(?:<!--\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*-->|%\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?))\s*$"
 )
 _DIRECTIVE_KEYS = frozenset({"answer", "tags", "kind", "id"})
+# A front-matter line: `key: value` (bare key, no spaces) or a `- ` list item.
+_YAML_LINE_RE = re.compile(r"^\s*(?:[\w.-]+\s*:|-\s)")
 _KINDS = frozenset({"computational", "proof", "mixed"})
 
 # \begin{problem} ... \end{problem} and friends, non-greedy, across lines.
@@ -57,12 +59,35 @@ class IngestError(RuntimeError):
 # --------------------------------------------------------------------------- splitting
 
 
+def strip_front_matter(text: str) -> str:
+    """Drop a leading YAML front-matter block.
+
+    `---` opens front matter only at the very top of a file; anywhere else it is
+    our problem separator. Without this a document's title and author get
+    ingested as a maths question.
+
+    The block must also *look* like YAML — every line a `key: value` or a `-`
+    list item. A leading `---` followed by prose is an empty first chunk before
+    a real problem, and eating that would delete the author's work.
+    """
+    lines = text.splitlines()
+    if not lines or not _SEPARATOR_RE.match(lines[0]):
+        return text
+    for i, line in enumerate(lines[1:], start=1):
+        if _SEPARATOR_RE.match(line):
+            block = [ln for ln in lines[1:i] if ln.strip()]
+            if block and all(_YAML_LINE_RE.match(ln) for ln in block):
+                return "\n".join(lines[i + 1 :])
+            return text
+    return text  # never closed: not front matter, just a leading separator
+
+
 def split_chunks(text: str) -> list[str]:
     """Split on `---` lines, ignoring separators inside fenced code blocks."""
     chunks: list[str] = []
     current: list[str] = []
     fence: str | None = None
-    for line in text.splitlines():
+    for line in strip_front_matter(text).splitlines():
         fence_match = _FENCE_RE.match(line)
         if fence_match:
             marker = fence_match.group(1)
@@ -77,10 +102,25 @@ def split_chunks(text: str) -> list[str]:
 
 
 def parse_directives(chunk: str) -> tuple[str, dict[str, str]]:
-    """Strip recognized ``<!-- key: value -->`` lines; return (statement, directives)."""
+    """Strip recognized ``<!-- key: value -->`` lines; return (statement, directives).
+
+    Fence-aware, for the same reason `split_chunks` is: a directive-shaped line
+    inside a code block is content a problem may be *about*, and consuming it
+    would both delete it from the statement and set metadata the author never wrote.
+    """
     kept: list[str] = []
     found: dict[str, str] = {}
+    fence: str | None = None
     for line in chunk.splitlines():
+        fence_match = _FENCE_RE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)
+            fence = None if fence == marker else (fence or marker)
+            kept.append(line)
+            continue
+        if fence is not None:
+            kept.append(line)
+            continue
         match = _DIRECTIVE_RE.match(line.strip())
         if match:
             html_key, html_value, tex_key, tex_value = match.groups()
@@ -133,6 +173,24 @@ def load_markdown(path: Path) -> list[dict[str, Any]]:
     return _chunks_to_fields(split_chunks(_read(path)), path)
 
 
+def _uncommented(body: str) -> str:
+    """Blank out whole-line LaTeX comments, keeping our own directive lines.
+
+    Commenting a problem out is how an author removes it from a `.tex` file; a
+    `% \\begin{problem}` that still extracted would resurrect deleted work.
+    Line-level only — an inline `x % note` is left alone — and `\\%` is not a
+    comment, so an escaped percent is untouched.
+    """
+    kept: list[str] = []
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        is_comment = stripped.startswith("%")
+        match = _DIRECTIVE_RE.match(stripped)
+        is_directive = bool(match) and (match.group(3) or "").lower() in _DIRECTIVE_KEYS
+        kept.append("" if is_comment and not is_directive else line)
+    return "\n".join(kept)
+
+
 def load_tex(path: Path) -> list[dict[str, Any]]:
     """`\\begin{problem}` environments if the file uses them, else `---` splitting.
 
@@ -141,22 +199,27 @@ def load_tex(path: Path) -> list[dict[str, Any]]:
     """
     text = _read(path)
     body = match.group(1) if (match := _TEX_DOCUMENT_RE.search(text)) else text
-    envs = [m.group(2) for m in _TEX_ENV_RE.finditer(body)]
+    envs = [m.group(2) for m in _TEX_ENV_RE.finditer(_uncommented(body))]
     return _chunks_to_fields([e.strip() for e in envs] if envs else split_chunks(body), path)
 
 
 def _json_item_fields(item: Any, path: Path, index: int) -> dict[str, Any]:
     where = f"{path} problem {index}"
     if isinstance(item, str):
+        if not item.strip():
+            raise IngestError(f"{where}: empty statement")
         return {"statement_md": item.strip(), "source_index": index}
     if not isinstance(item, dict):
         raise IngestError(f"{where}: expected an object or a string, got {type(item).__name__}")
-    statement = next(
-        (str(item[k]) for k in ("statement_md", "statement", "problem", "text") if item.get(k)),
-        None,
-    )
-    if not statement:
+    key = next((k for k in ("statement_md", "statement", "problem", "text") if item.get(k)), None)
+    if key is None:
         raise IngestError(f"{where}: no statement (expected one of statement_md/statement/problem/text)")
+    # str() on a list or dict would silently ship a Python repr as the problem text.
+    if not isinstance(item[key], str):
+        raise IngestError(f"{where}: {key} must be a string, got {type(item[key]).__name__}")
+    statement = item[key]
+    if not statement.strip():
+        raise IngestError(f"{where}: {key} is empty")
     fields: dict[str, Any] = {"statement_md": statement.strip(), "source_index": index}
     answer = next((item[k] for k in ("given_answer", "answer") if item.get(k) is not None), None)
     if answer is not None:

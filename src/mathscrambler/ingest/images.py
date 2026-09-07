@@ -41,6 +41,10 @@ def prepare_image_bytes(path: Path) -> bytes:
                 img.thumbnail((MAX_IMAGE_PX, MAX_IMAGE_PX), Image.LANCZOS)
             buffer = io.BytesIO()
             img.save(buffer, format="PNG")
+    except Image.DecompressionBombError as e:
+        # Derives from Exception, not OSError: uncaught it would abort the whole
+        # run over one hostile or merely enormous file.
+        raise IngestError(f"{path}: image is implausibly large, refusing to decode it ({e})") from e
     except (OSError, ValueError) as e:
         raise IngestError(f"{path}: not a readable image ({e})") from e
     return buffer.getvalue()

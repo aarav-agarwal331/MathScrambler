@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -257,23 +258,34 @@ def test_examples_directives_never_leak_into_statements():
         assert "\\begin{document}" not in problem.statement_md
 
 
-def test_ingest_never_mutates_its_inputs():
-    """Section 1.2: inputs are read-only. Hash the whole tree either side of a load."""
+def test_ingest_never_mutates_its_inputs(tmp_path: Path):
+    """Section 1.2: inputs are read-only.
+
+    Runs against a private COPY of examples/, not the shared tree. Snapshotting
+    the live tree made this vacuous in a full-suite run: an earlier test loads
+    examples/ first, so a loader that deleted (or renamed) what it read had
+    already done so before this guard took its "before" picture — the suite
+    stayed green while examples/ was emptied. Comparing whole dicts keyed by
+    relative path means a deletion or rename fails on the key set, not just on
+    content.
+    """
+    work = tmp_path / "inputs"
+    shutil.copytree(EXAMPLES, work)
+
     def digest() -> dict[str, tuple[str, int]]:
         return {
-            str(p.relative_to(EXAMPLES)): (
-                hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns
-            )
-            for p in sorted(EXAMPLES.rglob("*"))
+            str(p.relative_to(work)): (hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns)
+            for p in sorted(work.rglob("*"))
             if p.is_file()
         }
 
     before = digest()
-    load_text_inputs([EXAMPLES])
-    for path in sorted(EXAMPLES.rglob("*.png")):
+    assert len(before) >= 8, "examples/ should hold the full authored set"
+    result = load_text_inputs([work])
+    assert result.problems, "the copy must actually be ingested, or this guard proves nothing"
+    for path in sorted(work.rglob("*.png")):
         encode_image(path)  # the image path normalizes in memory only
     assert digest() == before
-    assert before, "examples/ should not be empty"
 
 
 # --------------------------------------------------------------------------- images
@@ -396,3 +408,91 @@ def test_vision_prompt_files_exist_and_say_what_matters():
 def test_missing_prompt_is_a_clear_error():
     with pytest.raises(prompts.PromptError, match="no prompt file"):
         prompts.load("no_such_prompt")
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+def test_discover_judges_only_the_path_below_the_named_directory(tmp_path: Path):
+    """A dotted or `outputs`-named component of the USER's own root must not
+    silently drop every file underneath it."""
+    root = tmp_path / ".config" / "outputs"
+    (root / "sub").mkdir(parents=True)
+    (root / "a.md").write_text("A problem.")
+    (root / "sub" / "b.md").write_text("Another.")
+    (root / ".hidden.md").write_text("hidden")
+    (root / "sub" / ".git").mkdir()
+    (root / "sub" / ".git" / "c.md").write_text("repo furniture")
+
+    found = discover([root])
+    assert [p.name for p in found.text_files] == ["a.md", "b.md"]
+    assert len(load_text_inputs([root]).problems) == 2
+
+
+def test_decompression_bomb_is_reported_not_fatal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """DecompressionBombError derives from Exception, not OSError — uncaught it
+    would abort the whole run over one oversized file."""
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 64)
+    big = _png(tmp_path / "big.png", size=(200, 200))
+    with pytest.raises(IngestError, match="implausibly large"):
+        prepare_image_bytes(big)
+
+
+def test_directives_inside_a_code_fence_are_content(tmp_path: Path):
+    """A directive-shaped line in a code block is text the problem may be about."""
+    src = tmp_path / "p.md"
+    src.write_text(
+        "Explain what this template emits.\n\n```\n<!-- answer: 42 -->\n```\n<!-- answer: 7 -->\n"
+    )
+    problem = load_text_inputs([src]).problems[0]
+    assert problem.given_answer == "7"  # the real directive, outside the fence
+    assert "<!-- answer: 42 -->" in problem.statement_md  # the fenced one survives verbatim
+
+
+def test_commented_out_tex_problem_is_not_resurrected(tmp_path: Path):
+    src = tmp_path / "g.tex"
+    src.write_text(
+        "\\begin{document}\n"
+        "\\begin{problem}\nLive problem.\n% answer: 3\n\\end{problem}\n"
+        "% \\begin{problem}\n% Deleted problem.\n% \\end{problem}\n"
+        "\\end{document}\n"
+    )
+    problems = load_text_inputs([src]).problems
+    assert [p.statement_md for p in problems] == ["Live problem."]
+    assert problems[0].given_answer == "3"  # our own directive survives the comment strip
+
+
+def test_yaml_front_matter_is_not_a_problem(tmp_path: Path):
+    src = tmp_path / "p.md"
+    src.write_text("---\ntitle: Week 3\nauthor: Sam\n---\n\nFind $x$ when $2x = 8$.\n")
+    problems = load_text_inputs([src]).problems
+    assert [p.statement_md for p in problems] == ["Find $x$ when $2x = 8$."]
+
+
+def test_leading_separator_without_a_close_is_not_front_matter(tmp_path: Path):
+    src = tmp_path / "p.md"
+    src.write_text("---\nFind $x$.\n")
+    assert [p.statement_md for p in load_text_inputs([src]).problems] == ["Find $x$."]
+
+
+def test_json_rejects_non_string_and_empty_statements(tmp_path: Path):
+    listy = tmp_path / "a.json"
+    listy.write_text(json.dumps([{"statement": ["para one", "para two"]}]))
+    assert "must be a string" in load_text_inputs([listy]).skipped[0].reason
+
+    blank = tmp_path / "b.json"
+    blank.write_text(json.dumps(["   ", {"statement_md": "  "}]))
+    result = load_text_inputs([blank])
+    assert result.problems == []
+    assert "empty" in result.skipped[0].reason
+
+
+def test_leading_separator_before_prose_is_an_empty_chunk_not_front_matter(tmp_path: Path):
+    """`---` then prose then `---` is an empty first problem, not metadata —
+    treating it as front matter would delete a real problem."""
+    src = tmp_path / "p.md"
+    src.write_text("---\nFind $x$ when $2x=8$.\n---\nSecond problem.\n")
+    assert [p.statement_md for p in load_text_inputs([src]).problems] == [
+        "Find $x$ when $2x=8$.",
+        "Second problem.",
+    ]

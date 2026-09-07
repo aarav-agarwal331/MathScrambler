@@ -122,7 +122,11 @@ def discover(inputs: Sequence[Path]) -> Discovered:
             for child in sorted(path.rglob("*")):
                 if not child.is_file():
                     continue
-                if any(part.startswith(".") or part in _SKIP_DIRS for part in child.parts):
+                # Judge only the part BELOW the directory the user named. Testing the
+                # whole path would let a component of their own root — `~/.config/probs`,
+                # or a folder they happen to call `outputs` — silently drop every file.
+                below = child.relative_to(path).parts
+                if any(part.startswith(".") or part in _SKIP_DIRS for part in below):
                     continue
                 if child.stem.lower() in _SKIP_STEMS:
                     continue
