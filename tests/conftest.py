@@ -89,7 +89,12 @@ class HttpStub:
         self.handler = handler
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.server.server_address[1]
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        # poll_interval, not the 0.5 s default: `shutdown()` waits up to one
+        # interval, and at ~24 stub tests that default was costing the suite
+        # more than ten seconds of pure waiting (criterion 6 wants < 10 s).
+        self.thread = threading.Thread(
+            target=lambda: self.server.serve_forever(poll_interval=0.02), daemon=True
+        )
         self.thread.start()
 
     def route(self, path: str, body: dict, status: int = 200) -> None:
@@ -117,3 +122,42 @@ def http_stub():
     stub = HttpStub()
     yield stub
     stub.close()
+
+
+# --------------------------------------------------------------- blueprint fixtures
+
+
+PEN_SOLVER = "def solve(p1, p2, p3):\n    return p3 // p1 * p2\n"
+
+# The worksheet problem from examples/images/page-worksheet.png, as a blueprint:
+# "A shop sells pens at 3 for $2. At the same rate, how much do 21 pens cost?"
+PEN_BLUEPRINT = {
+    "kind": "computational",
+    "domain": ["arithmetic", "ratio"],
+    "entities": [
+        {"slot": "E1", "original": "shop", "role": "place"},
+        {"slot": "E2", "original": "pens", "role": "countable object"},
+    ],
+    "parameters": [
+        {"slot": "p1", "original": 3, "type": "int", "description": "items per group"},
+        {"slot": "p2", "original": 2, "type": "int", "description": "price of one group"},
+        {"slot": "p3", "original": 21, "type": "int", "description": "items bought"},
+    ],
+    "constraints": ["divides(p1, p3)", "p3 > p1", "p1 > 1", "p2 > 0"],
+    "template_md": "A {E1} sells {E2} at ${p1}$ for $\\${p2}$. "
+    "At the same rate, how much do ${p3}$ {E2} cost?",
+    "solution_outline": [
+        "divide the count bought by the group size",
+        "multiply that many groups by the price per group",
+    ],
+    "solver_code": PEN_SOLVER,
+    "answer_type": "integer",
+    "invariants": ["answer must be a positive integer"],
+}
+
+
+@pytest.fixture()
+def pen_blueprint():
+    from mathscrambler.blueprint import Blueprint
+
+    return Blueprint.model_validate(PEN_BLUEPRINT)
