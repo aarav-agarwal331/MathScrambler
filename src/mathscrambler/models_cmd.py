@@ -99,12 +99,6 @@ def pull_missing(cfg: Config, console: Console, assume_yes: bool) -> int:
         size = setup_flow.registry_size(tag)
         size_text = f"{size / 1e9:.1f} GB" if size else "size unknown (registry unreachable or tag missing)"
         console.print(f" missing: [bold]{tag}[/bold] ({size_text})")
-        # Re-checked per tag: a pull elsewhere can start while an earlier tag downloads.
-        busy = ollama_server.pull_in_progress()
-        if busy:
-            console.print(f"   skipping: {busy}")
-            failures += 1
-            continue
         if setup_flow.needs_pull_approval(size, assume_yes):
             prompt = (
                 f"   {tag} is over 30 GB — pull it now?"
@@ -114,6 +108,13 @@ def pull_missing(cfg: Config, console: Console, assume_yes: bool) -> int:
             if not typer.confirm(prompt, default=False):
                 console.print(f"   skipped {tag}")
                 continue
+        # Collision check runs per tag, AFTER any confirm prompt: a pull elsewhere
+        # can start while an earlier tag downloads or while the user deliberates.
+        busy = ollama_server.pull_in_progress()
+        if busy:
+            console.print(f"   skipping: {busy}")
+            failures += 1
+            continue
         if not setup_flow.pull_model(info.base_url, tag, console):
             failures += 1
     return 1 if failures else 0

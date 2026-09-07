@@ -221,6 +221,47 @@ def test_models_pull_fetches_missing_only(monkeypatch: pytest.MonkeyPatch, examp
     assert pulled == ["qwen3.6:27b-mlx", "qwen3.6:35b-mlx"]
 
 
+def _pull_env(monkeypatch: pytest.MonkeyPatch, registry_bytes: int | None):
+    monkeypatch.setattr(models_cmd, "_installed_tags", lambda cfg: ({}, "private:11435"))
+    monkeypatch.setattr(models_cmd, "_residents", lambda cfg: {})
+    info = ollama_server.ServerInfo(
+        mode="private", base_url="http://127.0.0.1:21435", port=21435, pid=1, started_by_us=True
+    )
+    monkeypatch.setattr(models_cmd.ollama_server, "ensure_started", lambda cfg: info)
+    # all pulled except the reasoner, so exactly one >30GB tag is missing
+    monkeypatch.setattr(
+        models_cmd.ollama_server,
+        "api_tags",
+        lambda port: [{"name": t, "size": 1} for t in ("qwen3.6:35b-mlx", "qwen3.6:27b-mlx")],
+    )
+    monkeypatch.setattr(models_cmd.ollama_server, "pull_in_progress", lambda: None)
+    monkeypatch.setattr(models_cmd.setup_flow, "registry_size", lambda tag: registry_bytes)
+    pulled: list[str] = []
+    monkeypatch.setattr(
+        models_cmd.setup_flow, "pull_model", lambda url, tag, console: pulled.append(tag) or True
+    )
+    return pulled
+
+
+def test_models_pull_over_30gb_requires_confirmation(
+    monkeypatch: pytest.MonkeyPatch, example_cfg, tmp_home: Path
+):
+    pulled = _pull_env(monkeypatch, 65 * 1024**3)
+    result = runner.invoke(app, ["models", "--pull"], input="n\n")
+    assert result.exit_code == 0
+    assert pulled == [], "declining the >30GB confirm must skip the pull"
+    assert "skipped" in result.output
+
+
+def test_models_pull_yes_disarms_confirmation(
+    monkeypatch: pytest.MonkeyPatch, example_cfg, tmp_home: Path
+):
+    pulled = _pull_env(monkeypatch, 65 * 1024**3)
+    result = runner.invoke(app, ["models", "--pull", "--yes"])
+    assert result.exit_code == 0
+    assert pulled == ["gpt-oss:120b"]
+
+
 def test_models_pull_respects_collision_guard(monkeypatch: pytest.MonkeyPatch, example_cfg, tmp_home: Path):
     monkeypatch.setattr(models_cmd, "_installed_tags", lambda cfg: ({}, "private:11435"))
     monkeypatch.setattr(models_cmd, "_residents", lambda cfg: {})

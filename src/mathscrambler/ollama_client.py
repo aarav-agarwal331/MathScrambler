@@ -20,6 +20,7 @@ to the model verbatim, at most ``max_retries`` attempts per phase.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
@@ -29,6 +30,8 @@ from pydantic import BaseModel, ValidationError
 
 from mathscrambler import ollama_server
 from mathscrambler.config import ProfileRoles, Role, RoleConfig
+
+log = logging.getLogger("mathscrambler.ollama_client")
 
 CONNECT_TIMEOUT_S = 10.0
 DEFAULT_READ_TIMEOUT_S = 900.0  # cold-loading a 65 GB model under load takes minutes
@@ -44,10 +47,16 @@ class OllamaClientError(RuntimeError):
 class StructuredCallError(OllamaClientError):
     """All attempts (including any two-call fallback) failed; carries every error."""
 
-    def __init__(self, tag: str, attempts: list[str]):
+    def __init__(self, tag: str, attempts: list[str], calls: int | None = None):
         self.attempts = attempts
-        detail = "; ".join(attempts[-3:])
-        super().__init__(f"{tag}: no valid structured output after {len(attempts)} attempt(s): {detail}")
+        # Show both ends: the first error is usually the root cause that forced a
+        # mode fallback; the last ones are what finally gave up.
+        shown = attempts if len(attempts) <= 3 else [attempts[0], "…", *attempts[-2:]]
+        calls_note = f" over {calls} model call(s)" if calls else ""
+        super().__init__(
+            f"{tag}: no valid structured output after {len(attempts)} failed attempt(s)"
+            f"{calls_note}: {'; '.join(shown)}"
+        )
 
 
 # --------------------------------------------------------------------------- data
@@ -241,15 +250,28 @@ class OllamaClient:
         except httpx.HTTPStatusError as e:
             body = e.response.text[:500]
             if e.response.status_code == 400 and "think" in payload and "think" in body.lower():
-                # Family adapter self-heal: this tag rejects the think field. Retry
-                # once without it; only if that works is the tag marked unsupported
-                # (a 400 about a bad think VALUE must not poison the tag).
+                # Family adapter self-heal: retry once without the think field. Only
+                # a body saying the FIELD is unsupported marks the tag persistently —
+                # a 400 about a bad think VALUE also heals by dropping the field, but
+                # that's a config problem to surface, not a tag capability to cache.
                 payload.pop("think")
                 try:
                     result = await self._post_chat(payload, on_token)
                 except httpx.HTTPStatusError as e2:
-                    raise OllamaClientError(f"{rc.tag}: {e2.response.status_code} {body}") from e2
-                _mark_think_unsupported(rc.tag)
+                    raise OllamaClientError(
+                        f"{rc.tag}: retry without think failed: HTTP {e2.response.status_code}: "
+                        f"{e2.response.text[:300]} (original 400: {body})"
+                    ) from e2
+                if "does not support" in body.lower():
+                    _mark_think_unsupported(rc.tag)
+                else:
+                    log.warning(
+                        "%s rejected think=%r (%s); healed this call without persisting — "
+                        "check the role's think/reasoning_effort in config.toml",
+                        rc.tag,
+                        effective_think,
+                        body,
+                    )
                 return result
             raise OllamaClientError(f"{rc.tag}: HTTP {e.response.status_code}: {body}") from e
         except httpx.HTTPError as e:
@@ -272,6 +294,11 @@ class OllamaClient:
         thinking_parts: list[str] = []
         final: dict = {}
         async with self._client.stream("POST", "/api/chat", json=payload) as resp:
+            if resp.is_error:
+                # Buffer the error body while the stream is open: without this,
+                # e.response.text in chat()'s handlers raises ResponseNotRead and
+                # the think self-heal is unreachable for streamed calls.
+                await resp.aread()
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line.strip():
@@ -290,6 +317,13 @@ class OllamaClient:
                     on_token(message["content"])
                 if event.get("done"):
                     final = event
+        if not final:
+            # A cleanly-closed body without a done event is a truncated generation,
+            # not a success — partial content must never masquerade as complete.
+            raise OllamaClientError(
+                f"{payload['model']}: stream ended without a done event "
+                f"({len(content_parts)} content chunk(s) received)"
+            )
         return ChatResult(
             content="".join(content_parts),
             thinking="".join(thinking_parts) or None,
@@ -323,7 +357,7 @@ class OllamaClient:
         if mode == "direct":
             value = await self._structured_attempts(
                 role, list(messages), model_cls, schema, max_retries, errors, timings,
-                images=images, seed=seed, think=_UNSET,
+                images=images, seed=seed, think=_UNSET, phase="direct",
             )
             if value is not None:
                 if _cached_structured_mode(rc.tag) is None:
@@ -338,7 +372,7 @@ class OllamaClient:
             if mode == "direct":  # fell back and it worked: remember for this tag
                 _cache_structured_mode(rc.tag, "two_call")
             return StructuredResult(value=value, mode="two_call", timings=timings)
-        raise StructuredCallError(rc.tag, errors)
+        raise StructuredCallError(rc.tag, errors, calls=len(timings))
 
     async def _structured_attempts(
         self,
@@ -353,20 +387,21 @@ class OllamaClient:
         images: Sequence[str] | None,
         seed: int | None,
         think: bool | str | _Unset | None,
+        phase: str,
     ) -> M | None:
-        for attempt in range(max_retries):
-            result = await self.chat(
-                role, msgs, schema=schema, images=images if attempt == 0 else None,
-                seed=seed, think=think,
-            )
+        for _attempt in range(max_retries):
+            # Images ride along on EVERY attempt (chat attaches them to the latest
+            # user message) — a retry that can't see the image would let the model
+            # fabricate schema-valid values it can no longer ground.
+            result = await self.chat(role, msgs, schema=schema, images=images, seed=seed, think=think)
             timings.append(result.timing)
             try:
                 return model_cls.model_validate_json(result.content)
             except ValidationError as e:
                 first = e.errors()[0].get("msg", "invalid")
-                errors.append(f"validation: {first} ({e.error_count()} error(s))")
+                errors.append(f"{phase}: validation: {first} ({e.error_count()} error(s))")
             except ValueError:
-                errors.append(f"not JSON: {result.content[:80]!r}")
+                errors.append(f"{phase}: not JSON: {result.content[:80]!r}")
             msgs = [
                 *msgs,
                 {"role": "assistant", "content": result.content},
@@ -403,7 +438,7 @@ class OllamaClient:
         ]
         return await self._structured_attempts(
             role, extract_msgs, model_cls, schema, max_retries, errors, timings,
-            images=None, seed=seed, think=extract_think,
+            images=None, seed=seed, think=extract_think, phase="extract",
         )
 
     # ------------------------------------------------------------------ load management

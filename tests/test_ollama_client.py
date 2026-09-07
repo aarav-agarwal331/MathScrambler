@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 from pydantic import BaseModel
 
@@ -143,6 +144,64 @@ async def test_chat_400_on_think_retries_without_and_remembers(tmp_home: Path, h
     assert "think" not in http_stub.posts[2][1], "remembered: think omitted on later calls"
 
 
+async def test_chat_400_on_bad_think_value_heals_without_poisoning(tmp_home: Path, http_stub):
+    """A bad-VALUE 400 heals this call but must not persist think_unsupported."""
+    http_stub.post_route(
+        "/api/chat",
+        (400, {"error": 'invalid think value: "high"'}),
+        _chat_body("healed"),
+        (400, {"error": 'invalid think value: "high"'}),
+        _chat_body("healed again"),
+    )
+    async with _client(http_stub) as client:
+        result = await client.chat("reasoner", [{"role": "user", "content": "q"}])
+        assert result.content == "healed"
+        assert "think_unsupported" not in ollama_server.read_state()
+        await client.chat("reasoner", [{"role": "user", "content": "q2"}])
+    assert http_stub.posts[2][1]["think"] == "high", "not poisoned: think still sent on later calls"
+
+
+async def test_chat_streaming_400_self_heals(tmp_home: Path, http_stub):
+    """A streamed HTTP error must surface through the normal handlers (not
+    ResponseNotRead), so the think self-heal works for streaming too."""
+    http_stub.post_route(
+        "/api/chat",
+        (400, {"error": 'model does not support the "think" option'}),
+        [
+            {"message": {"content": "ok"}, "done": False},
+            _chat_body(""),
+        ],
+    )
+    seen: list[str] = []
+    async with _client(http_stub) as client:
+        result = await client.chat("reasoner", [{"role": "user", "content": "q"}], on_token=seen.append)
+    assert result.content == "ok"
+    assert seen == ["ok"]
+    assert "think" not in http_stub.posts[1][1]
+    assert "gpt-oss:test" in ollama_server.read_state()["think_unsupported"]
+
+
+async def test_chat_stream_without_done_event_raises(tmp_home: Path, http_stub):
+    http_stub.post_route("/api/chat", [{"message": {"content": "partial"}, "done": False}])
+    async with _client(http_stub) as client:
+        with pytest.raises(ollama_client.OllamaClientError, match="without a done event"):
+            await client.chat("vision", [{"role": "user", "content": "q"}], on_token=lambda _: None)
+
+
+async def test_chat_heal_retry_failure_reports_both_bodies(tmp_home: Path, http_stub):
+    http_stub.post_route(
+        "/api/chat",
+        (400, {"error": 'model does not support the "think" option'}),
+        (500, {"error": "model runner has unexpectedly stopped"}),
+    )
+    async with _client(http_stub) as client:
+        with pytest.raises(ollama_client.OllamaClientError) as exc:
+            await client.chat("reasoner", [{"role": "user", "content": "q"}])
+    msg = str(exc.value)
+    assert "500" in msg and "unexpectedly stopped" in msg, "the retry's own failure must be shown"
+    assert "original 400" in msg
+
+
 async def test_chat_unreachable_raises_client_error(tmp_home: Path):
     client = OllamaClient("http://127.0.0.1:9", ROLES)
     with pytest.raises(ollama_client.OllamaClientError, match="unreachable"):
@@ -227,7 +286,29 @@ async def test_structured_exhausted_raises_with_all_errors(tmp_home: Path, http_
             await client.structured("reasoner", [{"role": "user", "content": "q"}], Answer, max_retries=2)
     # 2 direct + two-call fallback (1 free-form that "succeeds" + 2 extraction failures)
     assert len(exc.value.attempts) == 4
-    assert "gpt-oss:test" in str(exc.value)
+    assert exc.value.attempts[0].startswith("direct:")
+    assert exc.value.attempts[-1].startswith("extract:")
+    msg = str(exc.value)
+    assert "gpt-oss:test" in msg
+    assert "5 model call(s)" in msg
+    assert "direct:" in msg, "the root-cause phase must be visible even when errors are elided"
+
+
+async def test_structured_retries_keep_images(tmp_home: Path, http_stub):
+    """A retry that can't see the image would let the model fabricate schema-valid
+    values — images must ride along on every attempt."""
+    http_stub.post_route(
+        "/api/chat",
+        _chat_body("not json"),
+        _chat_body('{"value": 3, "unit": "cm"}'),
+    )
+    async with _client(http_stub) as client:
+        await client.structured(
+            "vision", [{"role": "user", "content": "read the image"}], Answer, images=["b64img"]
+        )
+    for _, payload in http_stub.posts:
+        attached = [m for m in payload["messages"] if m.get("images") == ["b64img"]]
+        assert attached, "every attempt's payload must carry the image"
 
 
 # ------------------------------------------------------------------ preload
@@ -253,7 +334,11 @@ def test_state_helpers_roundtrip(tmp_home: Path):
     assert ollama_client._think_unsupported("x") is False
 
 
-def test_stub_ndjson_shape():
-    """The stream test's stub lines must match Ollama's NDJSON framing."""
-    lines = [json.dumps({"message": {"content": "he"}, "done": False})]
-    assert json.loads(lines[0])["message"]["content"] == "he"
+def test_stub_ndjson_framing(http_stub):
+    """The stub's list responses must really be newline-delimited JSON objects."""
+    http_stub.post_route("/p", [{"a": 1}, {"b": 2}])
+    resp = httpx.post(f"http://127.0.0.1:{http_stub.port}/p", json={})
+    assert resp.headers["content-type"] == "application/x-ndjson"
+    lines = resp.text.splitlines()
+    assert [json.loads(line) for line in lines] == [{"a": 1}, {"b": 2}]
+    assert resp.text.endswith("\n")

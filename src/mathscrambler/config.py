@@ -32,6 +32,17 @@ class RoleConfig(BaseModel):
     reasoning_effort: Literal["low", "medium", "high"] | None = None
     think: bool | None = None
 
+    @model_validator(mode="after")
+    def _one_think_style(self) -> RoleConfig:
+        """A model family takes effort levels (gpt-oss) OR a boolean (qwen), never
+        both — sending the wrong shape draws a 400 the client must not have to heal."""
+        if self.reasoning_effort is not None and self.think is not None:
+            raise ValueError(
+                f"{self.tag}: set at most one of reasoning_effort (gpt-oss family) "
+                "and think (qwen family)"
+            )
+        return self
+
 
 class ProfileRoles(BaseModel):
     """One profile's role table. A role may be a string naming another role (an alias)."""

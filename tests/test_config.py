@@ -92,6 +92,17 @@ def test_missing_profile_table_rejected_at_load_time(tmp_path: Path):
         load_config(bad)
 
 
+def test_role_rejects_both_think_styles():
+    """reasoning_effort (effort levels) and think (boolean) are different families'
+    shapes — both set would send the wrong one and draw an avoidable 400."""
+    from pydantic import ValidationError
+
+    from mathscrambler.config import RoleConfig
+
+    with pytest.raises(ValidationError, match="at most one"):
+        RoleConfig(tag="x", reasoning_effort="high", think=False)
+
+
 def test_config_ignores_poisoned_ollama_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OLLAMA_HOST", "0.0.0.0:6666")
     monkeypatch.setenv("OLLAMA_MAX_LOADED_MODELS", "99")
