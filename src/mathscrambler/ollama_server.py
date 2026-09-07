@@ -324,23 +324,49 @@ def _tail_this_spawn(path: Path, lines: int = 20) -> str:
     return "\n".join(all_lines[start:][-lines:])
 
 
+def _reap(pid: int) -> None:
+    """Clear a dead child from the process table, if it is ours to clear."""
+    with suppress(ChildProcessError, OSError):
+        os.waitpid(pid, os.WNOHANG)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is `pid` a running process?
+
+    A child we terminated but have not reaped is a zombie: really dead, still
+    in the process table. `psutil.pid_exists` says True for it, so a caller
+    that spawned the server itself — the normal case for `run`/`ui`, which
+    start a server and stop it at the end — would watch its own successful
+    kill time out and report the server as wedged.
+    """
+    try:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.AccessDenied:
+        return True  # alive and someone else's; never claim we killed it
+
+
 def _terminate_group(pid: int, term_wait_s: float) -> bool:
     """SIGTERM the process group, wait, escalate to SIGKILL. True if it's gone."""
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
+        _reap(pid)
         return True
     except PermissionError:
         return False
     deadline = time.monotonic() + term_wait_s
     while time.monotonic() < deadline:
-        if not psutil.pid_exists(pid):
+        _reap(pid)  # if we are the parent, this turns a zombie into a gone pid
+        if not _pid_alive(pid):
             return True
         time.sleep(0.1)
     with suppress(ProcessLookupError, PermissionError):
         os.killpg(pid, signal.SIGKILL)
     time.sleep(0.2)
-    return not psutil.pid_exists(pid)
+    _reap(pid)
+    return not _pid_alive(pid)
 
 
 def _spawn(

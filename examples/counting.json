@@ -1,0 +1,11 @@
+{
+  "problems": [
+    {
+      "id": "committee-two-women",
+      "statement_md": "A committee of $3$ people is chosen at random from a group of $7$ women and $5$ men. How many different committees contain exactly $2$ women?",
+      "answer": "105",
+      "tags": ["combinatorics", "counting", "binomial-coefficients"],
+      "kind": "computational"
+    }
+  ]
+}

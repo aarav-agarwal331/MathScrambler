@@ -460,3 +460,56 @@ def test_pull_in_progress_static_partial_still_blocks(tmp_path: Path):
 def test_pull_in_progress_clean_store(tmp_path: Path):
     (tmp_path / "blobs").mkdir()
     assert ollama_server.pull_in_progress(store=tmp_path, settle_s=0.05) is None
+
+
+def test_terminate_group_treats_our_own_zombie_as_gone():
+    """A child we kill but have not reaped is a zombie — dead, still in the table.
+
+    `run`/`ui` spawn the server and stop it themselves, so this is the ordinary
+    path: without reaping (or excluding zombies) the caller waits out the whole
+    timeout and then reports its own successful kill as "wedged".
+    """
+    import subprocess
+    import sys
+    import time
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        start_new_session=True,  # its own process group, as the real server is
+    )
+    try:
+        started = time.monotonic()
+        gone = ollama_server._terminate_group(child.pid, term_wait_s=5.0)
+        elapsed = time.monotonic() - started
+        assert gone, "SIGTERM worked; the zombie must not read as a live process"
+        assert elapsed < 2.0, f"waited {elapsed:.1f}s — the zombie was counted as alive"
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
+def test_pid_alive_is_false_for_an_unreaped_zombie():
+    """The exact trap: `psutil.pid_exists` is True for a zombie, so it cannot be
+    used to decide whether our own terminated child is gone."""
+    import subprocess
+    import sys
+    import time
+
+    import psutil
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    try:
+        assert ollama_server._pid_alive(child.pid) is True
+        child.terminate()  # deliberately NOT wait()ed: leaves a zombie
+        deadline = time.monotonic() + 5
+        while psutil.Process(child.pid).status() != psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline, "child never became a zombie"
+            time.sleep(0.02)
+
+        assert psutil.pid_exists(child.pid) is True  # the trap this replaced
+        assert ollama_server._pid_alive(child.pid) is False
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)

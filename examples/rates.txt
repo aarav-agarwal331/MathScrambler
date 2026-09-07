@@ -1,0 +1,6 @@
+One tap fills an empty tank in 12 minutes and a second tap fills the same tank
+in 18 minutes. If both taps are opened together on the empty tank, how many
+minutes does it take to fill?
+
+<!-- answer: 36/5 minutes (7.2 minutes) -->
+<!-- tags: rates, work, fractions -->
