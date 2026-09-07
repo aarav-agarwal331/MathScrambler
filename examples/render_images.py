@@ -117,14 +117,51 @@ def render_worksheet(path: Path) -> None:
     img.save(path)
 
 
+def render_vision_probe(path: Path) -> None:
+    """The known-answer image behind `bench`'s vision probe row.
+
+    Deliberately unguessable. `qwen3.6:35b-mlx` advertises `vision` and answers
+    about images it cannot see — asked about a red BANANA card it described a
+    black-and-white STOP sign, identically across formats and sizes — so a probe
+    whose answer a blind model could infer from the question proves nothing.
+    Hence an invented word, a colour nobody would assume, and two side lengths
+    that are not the 3-4-5 a model pattern-matches its way to (the 27b fallback
+    read a printed 9 and 12 as "3, 4, 5", which is the second failure mode).
+    """
+    img = Image.new("RGB", (900, 640), PAPER)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([(0, 0), (900, 200)], fill=(0, 128, 128))
+    draw.text((60, 76), "MERIDIAN", font=_font(SERIF_BOLD, 78), fill=(255, 255, 255))
+
+    draw.text((60, 250), "Solve for x:   7x - 4 = 31", font=_font(SERIF, 40), fill=INK)
+
+    bx, by = 150, 560
+    ax, ay = bx, by - 170
+    cx, cy = bx + 230, by
+    draw.line([(ax, ay), (bx, by), (cx, cy), (ax, ay)], fill=INK, width=3)
+    draw.line([(bx, by - 24), (bx + 24, by - 24), (bx + 24, by)], fill=INK, width=2)
+    label = _font(SERIF, 32)
+    draw.text((bx - 78, (ay + by) // 2 - 18), "17", font=label, fill=INK)
+    draw.text(((bx + cx) // 2 - 16, by + 14), "23", font=label, fill=INK)
+    img.save(path)
+
+
 def main() -> None:
-    out = Path(__file__).resolve().parent / "images"
+    root = Path(__file__).resolve().parent.parent
+    out = root / "examples" / "images"
     out.mkdir(exist_ok=True)
     render_linear(out / "page-linear.png")
     render_triangle(out / "page-triangle.png")
     render_worksheet(out / "page-worksheet.png")
-    for png in sorted(out.glob("*.png")):
-        print(f"wrote {png.relative_to(out.parent.parent)} ({png.stat().st_size / 1024:.0f} KB)")
+    written = sorted(out.glob("*.png"))
+
+    probe = root / "src" / "mathscrambler" / "bench_assets" / "vision_probe.png"
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    render_vision_probe(probe)
+    written.append(probe)
+
+    for png in written:
+        print(f"wrote {png.relative_to(root)} ({png.stat().st_size / 1024:.0f} KB)")
 
 
 if __name__ == "__main__":

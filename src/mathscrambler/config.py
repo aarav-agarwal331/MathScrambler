@@ -115,6 +115,9 @@ class BenchConfig(BaseModel):
 
     n_variants: int = 2
     candidates: list[str] = Field(default_factory=list)
+    # Scored on the known-answer probe image rather than on variant quality:
+    # a tag can advertise `vision` and still not decode an image at all.
+    vision_candidates: list[str] = Field(default_factory=list)
 
 
 class Config(BaseModel):

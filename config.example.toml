@@ -27,10 +27,11 @@ open_browser = true
 # another role to alias (e.g. fast = "vision" reuses the vision model).
 # ---------------------------------------------------------------------------
 
-# `fast` reuses the vision model by default: three separate resident models
-# (~107 GB of weights) would exceed the Metal wired-memory ceiling on a 128 GB
-# machine. To use a dedicated fast model instead, replace `fast = "vision"`
-# with a table:
+# `fast` reuses the vision model by default. With the spec's 24 GB vision model
+# three separate residents (~107 GB) would have exceeded the Metal wired-memory
+# ceiling on a 128 GB machine; qwen2.5vl:7b makes a dedicated `fast` affordable
+# (~6 + 65 + 19 GB), but sharing still costs nothing and leaves headroom for
+# ComfyUI. To use a dedicated fast model, replace `fast = "vision"` with a table:
 #   [roles.default.fast]
 #   tag = "qwen3.8:27b-mlx"
 #   num_ctx = 8192
@@ -39,8 +40,15 @@ open_browser = true
 [roles.default]
 fast = "vision"
 
+# NOT the spec's qwen3.6:35b-mlx. That tag advertises `vision` and cannot see:
+# on a red card reading "BANANA" it described a black-and-white STOP sign,
+# identically across PNG/JPEG and three sizes, and on a minimal-env server it
+# says outright that it cannot view images. The 27b fallback does decode, but
+# misreads figures — it read a printed "9 cm" and "12 cm" as "3, 4, 5".
+# qwen2.5vl:7b reads all three example pages correctly, figure labels included.
+# `mathscramble bench`'s vision probe row is how this gets revisited.
 [roles.default.vision]
-tag = "qwen3.6:35b-mlx"
+tag = "qwen2.5vl:7b"
 num_ctx = 8192
 temperature = 0.0
 think = false
@@ -55,7 +63,7 @@ reasoning_effort = "high"
 fast = "vision"
 
 [roles.lite.vision]
-tag = "qwen3.6:35b-mlx"
+tag = "qwen2.5vl:7b"
 num_ctx = 8192
 temperature = 0.0
 think = false
@@ -88,6 +96,20 @@ max_fraction = 0.85
 
 [bench]
 n_variants = 2
+# Candidate vision tags. Scored on a separate probe row: a known-answer image
+# (src/mathscrambler/bench_assets/) whose content cannot be guessed from the
+# question, because `ollama show`'s capability flags proved worthless — a tag
+# can advertise `vision` and confabulate. A tag that fails the probe is not
+# eligible for the `vision` role no matter how it scores elsewhere.
+# llama4:scout is already pulled but needs ~67 GB, so it cannot be probed while
+# another large model (or ComfyUI) is resident.
+vision_candidates = [
+    "qwen2.5vl:7b",
+    "llama3.2-vision:11b",
+    "llama4:scout",
+    "qwen3.6:35b-mlx",
+    "qwen3.6:27b-mlx",
+]
 # Candidate reasoner tags `mathscramble bench` compares out of the box.
 # Un-pulled tags are skipped with their pull size shown; tags that don't exist
 # in the registry (glm-5.3-flash currently 404s) are reported, never fatal.

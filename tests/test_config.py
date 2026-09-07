@@ -109,3 +109,23 @@ def test_config_ignores_poisoned_ollama_env(monkeypatch: pytest.MonkeyPatch):
     cfg = load_config(EXAMPLE)
     assert cfg.ollama.port == 11435
     assert cfg.ollama.max_loaded_models == 3
+
+
+def test_vision_probe_asset_is_present_and_self_consistent():
+    """The probe is the only trustworthy evidence a vision tag works (`ollama show`
+    flags are not), so it must ship with the package and stay parseable."""
+    import tomllib
+    from importlib import resources
+
+    assets = resources.files("mathscrambler.bench_assets")
+    spec = tomllib.loads(assets.joinpath("vision_probe.toml").read_text(encoding="utf-8"))
+    assert assets.joinpath(spec["image"]).is_file()
+    assert spec["must_contain"] and spec["colour_any_of"] and spec["must_not_contain"]
+    # A probe whose answer is inferable from its own question proves nothing.
+    prompt = spec["prompt"].lower()
+    assert not any(token in prompt for token in spec["must_contain"])
+
+
+def test_bench_vision_candidates_load_from_the_example_config():
+    cfg = load_config(EXAMPLE)
+    assert "qwen2.5vl:7b" in cfg.bench.vision_candidates

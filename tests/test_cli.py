@@ -217,11 +217,18 @@ def test_models_pull_fetches_missing_only(monkeypatch: pytest.MonkeyPatch, examp
     )
     result = runner.invoke(app, ["models", "--pull"])
     assert result.exit_code == 0
-    # union across profiles, minus the already-installed reasoner
-    assert pulled == ["qwen3.6:27b-mlx", "qwen3.6:35b-mlx"]
+    # union across profiles, minus the already-installed reasoner. Derived from
+    # the config rather than hardcoded: this asserts the union rule, and swapping
+    # a role's default tag should not look like a regression here.
+    assert pulled == _role_tags(example_cfg, without="gpt-oss:120b")
 
 
-def _pull_env(monkeypatch: pytest.MonkeyPatch, registry_bytes: int | None):
+def _role_tags(cfg, *, without: str | None = None) -> list[str]:
+    tags = {tag for table in cfg.roles.values() for tag in table.resolved_tags().values()}
+    return sorted(tags - {without} if without else tags)
+
+
+def _pull_env(monkeypatch: pytest.MonkeyPatch, cfg, registry_bytes: int | None):
     monkeypatch.setattr(models_cmd, "_installed_tags", lambda cfg: ({}, "private:11435"))
     monkeypatch.setattr(models_cmd, "_residents", lambda cfg: {})
     info = ollama_server.ServerInfo(
@@ -232,7 +239,7 @@ def _pull_env(monkeypatch: pytest.MonkeyPatch, registry_bytes: int | None):
     monkeypatch.setattr(
         models_cmd.ollama_server,
         "api_tags",
-        lambda port: [{"name": t, "size": 1} for t in ("qwen3.6:35b-mlx", "qwen3.6:27b-mlx")],
+        lambda port: [{"name": t, "size": 1} for t in _role_tags(cfg, without="gpt-oss:120b")],
     )
     monkeypatch.setattr(models_cmd.ollama_server, "pull_in_progress", lambda: None)
     monkeypatch.setattr(models_cmd.setup_flow, "registry_size", lambda tag: registry_bytes)
@@ -246,7 +253,7 @@ def _pull_env(monkeypatch: pytest.MonkeyPatch, registry_bytes: int | None):
 def test_models_pull_over_30gb_requires_confirmation(
     monkeypatch: pytest.MonkeyPatch, example_cfg, tmp_home: Path
 ):
-    pulled = _pull_env(monkeypatch, 65 * 1024**3)
+    pulled = _pull_env(monkeypatch, example_cfg, 65 * 1024**3)
     result = runner.invoke(app, ["models", "--pull"], input="n\n")
     assert result.exit_code == 0
     assert pulled == [], "declining the >30GB confirm must skip the pull"
@@ -256,7 +263,7 @@ def test_models_pull_over_30gb_requires_confirmation(
 def test_models_pull_yes_disarms_confirmation(
     monkeypatch: pytest.MonkeyPatch, example_cfg, tmp_home: Path
 ):
-    pulled = _pull_env(monkeypatch, 65 * 1024**3)
+    pulled = _pull_env(monkeypatch, example_cfg, 65 * 1024**3)
     result = runner.invoke(app, ["models", "--pull", "--yes"])
     assert result.exit_code == 0
     assert pulled == ["gpt-oss:120b"]

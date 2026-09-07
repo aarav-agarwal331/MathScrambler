@@ -1,0 +1,26 @@
+# Ground truth for `mathscramble bench`'s vision probe row.
+#
+# Why this row exists: `ollama show` capability flags are not evidence that a
+# modality works. `qwen3.6:35b-mlx` advertises `vision`, and on the private
+# server it either answers "I cannot view images" or confabulates a confident
+# description of an image it never decoded. A probe is the only trustworthy
+# test, and only if its answer cannot be guessed from the question.
+#
+# Regenerate the PNG with `uv run python examples/render_images.py`.
+
+image = "vision_probe.png"
+prompt = """Describe this image. State the background colour of the top band, \
+the word printed on it, the equation printed below it, and the two numbers \
+labelling the sides of the triangle."""
+
+# Case-insensitive substring checks after whitespace/LaTeX normalization.
+# "MERIDIAN" is invented, 17/23 are not a Pythagorean cliche, and 31 comes from
+# the printed equation — none of them are inferable from the prompt above.
+must_contain = ["meridian", "17", "23", "31"]
+
+# Any one of these counts as reading the colour.
+colour_any_of = ["teal", "turquoise", "cyan", "blue-green", "green-blue"]
+
+# The two observed failure modes, as explicit sentinels: an outright refusal,
+# and the stock confabulated answer.
+must_not_contain = ["cannot view", "unable to view", "can't view", "stop sign", "3-4-5"]
