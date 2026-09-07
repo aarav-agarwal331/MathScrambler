@@ -37,6 +37,7 @@ packages = ["src/mathscrambler"]
 
 [tool.pytest.ini_options]
 addopts = "-m 'not ollama' -q"
+asyncio_mode = "auto"
 markers = [
     "ollama: integration tests that need a live Ollama server (run with -m ollama)",
 ]

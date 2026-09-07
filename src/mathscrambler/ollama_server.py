@@ -255,7 +255,8 @@ def pull_in_progress(store: Path | None = None, settle_s: float = 3.0) -> str | 
 # --------------------------------------------------------------------------- state file
 
 
-def _read_state() -> dict:
+def read_state() -> dict:
+    """state.json: capability-probe results, shared-mode verification, misc caches."""
     try:
         data = json.loads(paths.state_file_path().read_text())
         return data if isinstance(data, dict) else {}
@@ -263,8 +264,8 @@ def _read_state() -> dict:
         return {}
 
 
-def _write_state(update: dict) -> None:
-    state = _read_state()
+def write_state(update: dict) -> None:
+    state = read_state()
     state.update(update)
     path = paths.state_file_path()
     tmp = path.with_suffix(".tmp")
@@ -515,7 +516,7 @@ def _try_shared_mode(config: Config) -> ServerInfo | None:
     if version is None:
         return None
 
-    state = _read_state()
+    state = read_state()
     verified_at = state.get("shared_verified_at")
     if verified_at:
         try:
@@ -554,7 +555,7 @@ def _try_shared_mode(config: Config) -> ServerInfo | None:
     except httpx.HTTPError:
         return None
     if len(loaded) >= 2:
-        _write_state({"shared_verified_at": datetime.now(UTC).isoformat(), "shared_version": version})
+        write_state({"shared_verified_at": datetime.now(UTC).isoformat(), "shared_version": version})
         return ServerInfo(
             mode="shared", base_url=f"http://127.0.0.1:{port}", port=port, pid=None, started_by_us=False
         )

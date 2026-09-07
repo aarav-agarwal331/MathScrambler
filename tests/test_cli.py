@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from mathscrambler import cli, doctor, ollama_server, setup_flow
+from mathscrambler import cli, doctor, models_cmd, ollama_server, paths, setup_flow
 from mathscrambler.cli import app
 from mathscrambler.doctor import Check, Level
 
@@ -162,6 +162,85 @@ def test_vendor_katex_skips_only_when_complete(monkeypatch: pytest.MonkeyPatch, 
     network_hits.clear()
     setup_flow.vendor_katex(Console(record=True))
     assert not network_hits, "a complete vendor must not hit the network"
+
+
+# ------------------------------------------------------------------ models command
+
+
+@pytest.fixture()
+def example_cfg(monkeypatch: pytest.MonkeyPatch):
+    from mathscrambler.config import load_config
+
+    cfg = load_config(paths.config_example_path())
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    return cfg
+
+
+def test_models_lists_pulled_and_missing(monkeypatch: pytest.MonkeyPatch, example_cfg, tmp_home: Path):
+    monkeypatch.setattr(
+        models_cmd, "_installed_tags", lambda cfg: ({"gpt-oss:120b": 65_000_000_000}, "private:11435")
+    )
+    monkeypatch.setattr(models_cmd, "_residents", lambda cfg: {"gpt-oss:120b": "private"})
+    result = runner.invoke(app, ["models"])
+    assert result.exit_code == 0
+    assert "reasoner" in result.output
+    assert "not pulled" in result.output  # vision tag absent from installed
+    assert "65.0 GB" in result.output.replace("\n", "")
+    assert "private" in result.output
+
+
+def test_models_list_without_any_server(monkeypatch: pytest.MonkeyPatch, example_cfg, tmp_home: Path):
+    monkeypatch.setattr(models_cmd, "_installed_tags", lambda cfg: None)
+    monkeypatch.setattr(models_cmd, "_residents", lambda cfg: {})
+    result = runner.invoke(app, ["models"])
+    assert result.exit_code == 0
+    assert "no reachable server" in result.output
+
+
+def test_models_pull_fetches_missing_only(monkeypatch: pytest.MonkeyPatch, example_cfg, tmp_home: Path):
+    monkeypatch.setattr(models_cmd, "_installed_tags", lambda cfg: ({}, "private:11435"))
+    monkeypatch.setattr(models_cmd, "_residents", lambda cfg: {})
+    info = ollama_server.ServerInfo(
+        mode="private", base_url="http://127.0.0.1:21435", port=21435, pid=1, started_by_us=True
+    )
+    monkeypatch.setattr(models_cmd.ollama_server, "ensure_started", lambda cfg: info)
+    monkeypatch.setattr(
+        models_cmd.ollama_server,
+        "api_tags",
+        lambda port: [{"name": "gpt-oss:120b", "size": 65_000_000_000}],
+    )
+    monkeypatch.setattr(models_cmd.ollama_server, "pull_in_progress", lambda: None)
+    monkeypatch.setattr(models_cmd.setup_flow, "registry_size", lambda tag: 20 * 1024**3)
+    pulled: list[str] = []
+    monkeypatch.setattr(
+        models_cmd.setup_flow, "pull_model", lambda url, tag, console: pulled.append(tag) or True
+    )
+    result = runner.invoke(app, ["models", "--pull"])
+    assert result.exit_code == 0
+    # union across profiles, minus the already-installed reasoner
+    assert pulled == ["qwen3.6:27b-mlx", "qwen3.6:35b-mlx"]
+
+
+def test_models_pull_respects_collision_guard(monkeypatch: pytest.MonkeyPatch, example_cfg, tmp_home: Path):
+    monkeypatch.setattr(models_cmd, "_installed_tags", lambda cfg: ({}, "private:11435"))
+    monkeypatch.setattr(models_cmd, "_residents", lambda cfg: {})
+    info = ollama_server.ServerInfo(
+        mode="private", base_url="http://127.0.0.1:21435", port=21435, pid=1, started_by_us=True
+    )
+    monkeypatch.setattr(models_cmd.ollama_server, "ensure_started", lambda cfg: info)
+    monkeypatch.setattr(models_cmd.ollama_server, "api_tags", lambda port: [])
+    monkeypatch.setattr(
+        models_cmd.ollama_server, "pull_in_progress", lambda: "a pull is in progress elsewhere"
+    )
+    monkeypatch.setattr(models_cmd.setup_flow, "registry_size", lambda tag: 1024)
+    monkeypatch.setattr(
+        models_cmd.setup_flow,
+        "pull_model",
+        lambda *a, **k: pytest.fail("must not pull while another pull is in flight"),
+    )
+    result = runner.invoke(app, ["models", "--pull"])
+    assert result.exit_code == 1
+    assert "skipping" in result.output
 
 
 def test_doctor_run_checks_smoke(tmp_home: Path, monkeypatch: pytest.MonkeyPatch):

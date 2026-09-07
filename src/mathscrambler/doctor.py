@@ -225,7 +225,14 @@ def _check_memory(cfg: Config | None) -> Check:
     note = f" (un-pulled tags not counted: {', '.join(unknown)})" if unknown else ""
     if gate.ok:
         return Check("memory", Level.GREEN, gate.message + note)
-    return Check("memory", Level.RED, gate.message + note, fix="mathscramble run ... --lite")
+    return Check(
+        "memory",
+        Level.RED,
+        gate.message + note + " — the lite profile (smaller reasoner) fits alongside the "
+        "consumers named above",
+        fix="add --lite to run/ui commands (e.g. `mathscramble run examples/ --lite`), "
+        "or wait for the named consumers to quiesce",
+    )
 
 
 def _check_comfyui() -> Check:

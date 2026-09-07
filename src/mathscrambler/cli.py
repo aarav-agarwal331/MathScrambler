@@ -11,9 +11,9 @@ import logging
 import typer
 from rich.console import Console
 
-from mathscrambler import __version__, ollama_server, setup_flow
+from mathscrambler import __version__, models_cmd, ollama_server, setup_flow
 from mathscrambler import doctor as doctor_mod
-from mathscrambler.config import load_config
+from mathscrambler.config import ConfigError, load_config
 
 app = typer.Typer(
     name="mathscramble",
@@ -48,6 +48,22 @@ def setup(
 def doctor() -> None:
     """Environment health report (green/yellow/red; every red comes with its fix)."""
     raise typer.Exit(doctor_mod.render(doctor_mod.run_checks(), console))
+
+
+@app.command()
+def models(
+    pull: bool = typer.Option(False, "--pull", help="Pull missing configured models (private server)."),
+    yes: bool = typer.Option(False, "--yes", help="Assume yes for >30 GB pull confirmations."),
+) -> None:
+    """List configured role models (pulled/size/resident); --pull fetches missing ones."""
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+    models_cmd.list_models(cfg, console)
+    if pull:
+        raise typer.Exit(models_cmd.pull_missing(cfg, console, assume_yes=yes))
 
 
 @server_app.command("start")
