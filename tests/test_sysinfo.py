@@ -86,6 +86,28 @@ def test_detect_comfyui_clean(monkeypatch: pytest.MonkeyPatch):
     assert not sysinfo.detect_comfyui(port=1).running
 
 
+def test_detect_comfyui_ignores_processes_that_merely_mention_it(monkeypatch: pytest.MonkeyPatch):
+    """An agent/editor session opened on the ComfyUI folder is not ComfyUI (live false positive)."""
+    monkeypatch.setattr(
+        sysinfo.psutil,
+        "process_iter",
+        lambda attrs: [
+            _FakeProc(1, ["/Applications/Claude.app/Contents/MacOS/claude", "--add-dir", "/u/ComfyUI"]),
+            _FakeProc(2, ["/bin/zsh", "-c", "cd ~/Claude_ComfyUI && ls"]),
+            _FakeProc(3, ["/u/Claude_ComfyUI/.venv/bin/python", "-c", "print(1)"]),
+        ],
+    )
+    assert not sysinfo.detect_comfyui(port=1).running
+    monkeypatch.setattr(
+        sysinfo.psutil,
+        "process_iter",
+        lambda attrs: [
+            _FakeProc(4, ["/u/ComfyUI/.venv/bin/python3.12", "/u/ComfyUI/main.py", "--listen"]),
+        ],
+    )
+    assert sysinfo.detect_comfyui(port=1).running
+
+
 def test_detect_comfyui_via_port(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(sysinfo.psutil, "process_iter", lambda attrs: [])
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:

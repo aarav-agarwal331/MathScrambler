@@ -7,9 +7,11 @@ refuse rather than push the machine past `memory.max_fraction` of physical RAM.
 
 from __future__ import annotations
 
+import re
 import socket
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import psutil
 
@@ -70,18 +72,35 @@ class ComfyUIStatus:
     signals: list[str] = field(default_factory=list)
 
 
+_PYTHON_RE = re.compile(r"^python(\d+(\.\d+)*)?$")
+
+
+def _is_comfyui_process(cmdline: list[str]) -> bool:
+    """A Python interpreter running a script from a ComfyUI tree.
+
+    ComfyUI is launched as `<tree>/.venv/bin/python <tree>/main.py ...`, so the
+    interpreter and the script path are the signal. Matching "comfyui" anywhere
+    in a cmdline is not: any process that merely *mentions* the directory — an
+    editor or agent session opened on it — would be counted as the GPU-heavy
+    server and make the memory gate refuse for nothing.
+    """
+    if not cmdline or not _PYTHON_RE.match(Path(cmdline[0]).name.lower()):
+        return False
+    return any(arg.lower().endswith(".py") and "comfyui" in arg.lower() for arg in cmdline[1:])
+
+
 def detect_comfyui(port: int = COMFYUI_PORT) -> ComfyUIStatus:
-    """Two independent signals: the default listener port, and a cmdline scan."""
+    """Two independent signals: the default listener port, and a process scan."""
     signals: list[str] = []
     if port_in_use(port):
         signals.append(f"listener on 127.0.0.1:{port}")
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
-            cmdline = " ".join(proc.info["cmdline"] or [])
+            cmdline = list(proc.info["cmdline"] or [])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-        if "comfyui" in cmdline.lower():
-            signals.append(f"process {proc.info['pid']}: {cmdline[:80]}")
+        if _is_comfyui_process(cmdline):
+            signals.append(f"process {proc.info['pid']}: {' '.join(cmdline)[:80]}")
             break
     return ComfyUIStatus(running=bool(signals), signals=signals)
 
@@ -131,9 +150,7 @@ def memory_gate(
             f"<= {limit / gb:.1f} GB ({max_fraction:.0%} of {mem.total / gb:.0f} GB)"
         )
     else:
-        who = ", ".join(
-            f"{name}: {size / gb:.1f} GB" if size else name for name, size in attribution
-        )
+        who = ", ".join(f"{name}: {size / gb:.1f} GB" if size else name for name, size in attribution)
         message = (
             f"refusing to load models: {in_use / gb:.1f} GB in use + {projected / gb:.1f} GB projected "
             f"exceeds {limit / gb:.1f} GB ({max_fraction:.0%} of {mem.total / gb:.0f} GB). "
