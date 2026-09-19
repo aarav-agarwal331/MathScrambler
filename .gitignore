@@ -1,14 +1,41 @@
-# local state
+# local configuration and state (model choices, ports) — copy config.example.toml instead
 config.toml
+.env
+.env.*
+
+# run outputs: results, and run.log transcripts that contain full prompts,
+# model replies and absolute paths from this machine
 outputs/
+run.log
+*.log
+*.rec.json
+
+# Python
 .venv/
+venv/
 __pycache__/
 *.pyc
-.pytest_cache/
-.ruff_cache/
 *.egg-info/
 dist/
 build/
-.DS_Store
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# model weights and other large binaries never belong in git
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
 # vendored at setup time (large binary assets, re-fetchable)
 src/mathscrambler/web/static/katex/
+
+# editor / OS / agent cruft
+.DS_Store
+.idea/
+.vscode/
+.claude/

@@ -1,26 +1,25 @@
-# MathScrambler — Master Prompt v2 (isolated, self-configuring)
-> Paste everything below this line into Claude Code inside the `claude_MathScrambler` folder.
-> If you already started from v1: the spec is the same except **Section 0 (constraints)** and the new **Section 1 (isolation & environment)** — everything MathScrambler needs now lives in a dedicated Ollama server on its own port, with env vars scoped to that one process, so nothing global on this Mac is touched. Update `PLAN.md` to match and continue.
+# MathScrambler — Specification v2 (isolated, self-configuring)
+> The build specification the project was written against, kept as the design record. v2 differs from v1 in **Section 0 (constraints)** and the new **Section 1 (isolation & environment)**: everything MathScrambler needs lives in a dedicated Ollama server on its own port, with env vars scoped to that one process, so nothing global on the host Mac is touched. `PLAN.md` tracks what was actually built against it.
 ---
-You are building **MathScrambler**: a fully local tool on my MacBook Pro (Apple M5 Max, 128 GB unified memory, macOS) that takes math problems I give it — typed text, Markdown/LaTeX, or **photos/screenshots of problems** — and produces new problems that are **logically isomorphic**: same solution path, same proof structure, same difficulty, same answer *type*, but with the **nouns / names / objects / scenario swapped** and the **numbers changed** (re-sampled under the original problem's constraints so the new problem is still well-posed and its answer is exactly computable).
-Everything runs on-device through **Ollama** (no cloud API calls, ever). I need two ways to use it:
-1. **Interactive mode** — a custom local web dashboard I open with one short terminal command, where I upload images or paste problems, pick how many variants I want, watch them generate, review original-vs-variant side by side with rendered LaTeX, and export.
-2. **Pipeline mode** — a CLI I can point at a file or folder of problems (text, `.md`, `.tex`, `.json`, or images) that batch-generates variants non-interactively and writes JSON + Markdown outputs. Same engine the dashboard calls; exactly one code path for generation.
-This machine also runs **other pipelines** (a ComfyUI image-generation setup, and other projects that use Ollama). **MathScrambler must never change, break, or slow down any of them.** Section 1 tells you exactly how to achieve that. You do the environment setup yourself — I should not have to edit shell profiles, plists, or Ollama settings by hand.
-Work in this order: read this whole spec, write a short `PLAN.md`, ask me blocking questions once in a batch, then build incrementally with tests, running things for real against the local Ollama as you go. Do not stub out model calls and call it done.
+**MathScrambler** is a fully local tool for an Apple-silicon Mac (developed on an M5 Max with 128 GB unified memory, macOS) that takes math problems — typed text, Markdown/LaTeX, or **photos/screenshots of problems** — and produces new problems that are **logically isomorphic**: same solution path, same proof structure, same difficulty, same answer *type*, but with the **nouns / names / objects / scenario swapped** and the **numbers changed** (re-sampled under the original problem's constraints so the new problem is still well-posed and its answer is exactly computable).
+Everything runs on-device through **Ollama** (no cloud API calls, ever). Two ways to use it:
+1. **Interactive mode** — a custom local web dashboard opened with one short terminal command, where the user uploads images or pastes problems, picks how many variants they want, watches them generate, reviews original-vs-variant side by side with rendered LaTeX, and exports.
+2. **Pipeline mode** — a CLI that can be pointed at a file or folder of problems (text, `.md`, `.tex`, `.json`, or images) that batch-generates variants non-interactively and writes JSON + Markdown outputs. Same engine the dashboard calls; exactly one code path for generation.
+The development machine also runs **other pipelines** (a ComfyUI image-generation setup, and other projects that use Ollama). **MathScrambler must never change, break, or slow down any of them.** Section 1 specifies exactly how. The tool does its own environment setup — the user should not have to edit shell profiles, plists, or Ollama settings by hand.
+Working order: read the whole spec, write a short `PLAN.md`, raise blocking questions once in a batch, then build incrementally with tests, running things for real against the local Ollama throughout. Model calls are never stubbed out and called done.
 ---
 ## 0. Hard constraints
 - **Local only.** No OpenAI/Anthropic/HF Inference calls. Network is allowed only for `ollama pull` and package installs.
-- **Runtime: Ollama** (≥ 0.19 so the MLX backend is active on Apple Silicon). If not installed, give me the exact install step and stop until I confirm. Do not install LM Studio, vLLM, or a separate llama.cpp.
+- **Runtime: Ollama** (≥ 0.19 so the MLX backend is active on Apple Silicon). If not installed, print the exact install step and stop until the user confirms. Do not install LM Studio, vLLM, or a separate llama.cpp.
 - **Python 3.12+, managed with `uv`**, in a project-local `.venv`. One installable package `mathscrambler` exposing console script **`mathscramble`** (alias **`ms`**). Install with `uv tool install -e .` so the command works from any directory. Nothing installed into the system Python or any other project's venv.
-- **The one-command launch** is literally `mathscramble ui` (starts everything it needs, opens the dashboard in my browser). No `cd`, no `source .venv/bin/activate`, no `python -m`.
-- **Zero global side effects** (details in Section 1): do not write to `~/.zshrc`, `~/.zprofile`, `~/.bash_profile`, `launchctl setenv`, `/Library/LaunchDaemons`, `~/Library/LaunchAgents`, or the Ollama app's settings. Do not restart, reconfigure, or kill the user's existing Ollama server. Do not change `OLLAMA_MODELS`. The only files you create outside this repo are under `~/Library/Application Support/MathScrambler/` (runs, logs, SQLite) and the `uv tool` shim.
+- **The one-command launch** is literally `mathscramble ui` (starts everything it needs, opens the dashboard in the browser). No `cd`, no `source .venv/bin/activate`, no `python -m`.
+- **Zero global side effects** (details in Section 1): do not write to `~/.zshrc`, `~/.zprofile`, `~/.bash_profile`, `launchctl setenv`, `/Library/LaunchDaemons`, `~/Library/LaunchAgents`, or the Ollama app's settings. Do not restart, reconfigure, or kill the user's existing Ollama server. Do not change `OLLAMA_MODELS`. The only files created outside this repo are under `~/Library/Application Support/MathScrambler/` (runs, logs, SQLite) and the `uv tool` shim.
 - Models are configured in one file, `config.toml`, never hard-coded.
-- Never mutate my input files. Outputs go to `./outputs/<timestamp>-<slug>/` (pipeline) or the app-support runs folder (dashboard).
+- Never mutate input files. Outputs go to `./outputs/<timestamp>-<slug>/` (pipeline) or the app-support runs folder (dashboard).
 - macOS only.
 ---
 ## 1. Isolation & environment — how MathScrambler coexists with everything else on this Mac
-### 1.1 The problem you're solving
+### 1.1 The problem being solved
 This Mac has a system-wide Ollama that other projects depend on, and a prior project set **`OLLAMA_MAX_LOADED_MODELS=1`** (verify with `launchctl getenv OLLAMA_MAX_LOADED_MODELS`, `env | grep OLLAMA`, and `ollama ps` behaviour). MathScrambler needs **≥ 2 models resident** (vision + reasoner) and a long keep-alive. Changing the global setting would alter behaviour for every other Ollama user on this machine. So: **don't.**
 ### 1.2 The design: a private Ollama server, shared model weights
 - MathScrambler runs **its own `ollama serve` process** on a dedicated port, **`127.0.0.1:11435`** (configurable in `config.toml`; if busy, walk up to the next free port and record it in the run log). The user's default server on `11434` is never touched.
@@ -32,8 +31,8 @@ This Mac has a system-wide Ollama that other projects depend on, and a prior pro
   - `OLLAMA_FLASH_ATTENTION=1`
   - `OLLAMA_KV_CACHE_TYPE=q8_0`
   - **Do not set `OLLAMA_MODELS`** — inherit the default so the private server **shares the same model store** as the global one (`~/.ollama/models` or wherever the user's store already is; detect it, don't assume). Pulled weights are downloaded once and visible to both servers. Concurrent *pulls* of the same tag from two servers can corrupt a blob — so `mathscramble models --pull` must refuse to run if the global server is mid-pull (check `ollama ps`/`/api/ps` on 11434 and the `~/.ollama/models/blobs/*-partial*` files).
-- **Lifecycle:** `mathscramble ui` and `mathscramble run` start the private server on demand if it isn't already running (write its PID to `~/Library/Application Support/MathScrambler/ollama.pid`, log to `.../logs/ollama.log`), wait until `/api/version` answers, and use it. `mathscramble ui` stops it on Ctrl-C / shutdown (SIGTERM, then wait) unless `--keep-server`. `mathscramble run` leaves it up for `keep_alive` then it idles at ~0 memory (models unload); add `mathscramble server stop|status|start` for manual control. Never send signals to any Ollama process you didn't start — match on the PID file, not on process name.
-- **Memory etiquette:** before loading models, read free memory (`vm_stat` / `sysctl hw.memsize` + `memory_pressure`) and check whether the global Ollama has models resident (`/api/ps` on 11434) or ComfyUI is running (look for a `ComfyUI`/`main.py` process or port `8188`). If the resident footprint of the configured MathScrambler models would push the machine past **~85% of physical memory**, refuse to start, tell me exactly what's using the memory, and offer `--lite` (Section 2.2). Never evict another server's models.
+- **Lifecycle:** `mathscramble ui` and `mathscramble run` start the private server on demand if it isn't already running (write its PID to `~/Library/Application Support/MathScrambler/ollama.pid`, log to `.../logs/ollama.log`), wait until `/api/version` answers, and use it. `mathscramble ui` stops it on Ctrl-C / shutdown (SIGTERM, then wait) unless `--keep-server`. `mathscramble run` leaves it up for `keep_alive` then it idles at ~0 memory (models unload); add `mathscramble server stop|status|start` for manual control. Never send signals to any Ollama process MathScrambler didn't start — match on the PID file, not on process name.
+- **Memory etiquette:** before loading models, read free memory (`vm_stat` / `sysctl hw.memsize` + `memory_pressure`) and check whether the global Ollama has models resident (`/api/ps` on 11434) or ComfyUI is running (look for a `ComfyUI`/`main.py` process or port `8188`). If the resident footprint of the configured MathScrambler models would push the machine past **~85% of physical memory**, refuse to start, report exactly what's using the memory, and offer `--lite` (Section 2.2). Never evict another server's models.
 - **Ports:** dashboard defaults to **`127.0.0.1:8765`**; if taken, pick the next free port and print it. Bind to loopback only. Nothing MathScrambler listens on is reachable from the network.
 - **Filesystem:** repo + `.venv` + `outputs/` inside `claude_MathScrambler/`; state under `~/Library/Application Support/MathScrambler/`. No files anywhere else.
 - **Detection of a friendly global server:** if the global server on 11434 is *already* configured with `OLLAMA_MAX_LOADED_MODELS ≥ 2` (probe by loading two tiny models and checking `/api/ps`), `config.toml` may set `ollama.mode = "shared"` to reuse it instead of spawning a private server. Default is `"private"`. Either way the code path is identical: the client just gets a base URL.
@@ -41,7 +40,7 @@ This Mac has a system-wide Ollama that other projects depend on, and a prior pro
 Ollama binary + version (≥ 0.19); global server status on 11434 and its `MAX_LOADED_MODELS` (informational only); private server status/port; model store path and free disk; each configured role → tag pulled? size? MLX tag? resident?; physical memory, current free memory, projected footprint with the configured roles; ComfyUI/other GPU-heavy processes detected; sandbox self-test; dashboard port availability; `uv tool` shim on `PATH`. Every red item comes with the one command that fixes it.
 ### 1.4 What `mathscramble setup` does (run once, idempotent, no sudo)
 1. Creates `~/Library/Application Support/MathScrambler/{runs,logs}`.
-2. Verifies/creates the `uv` venv and installs the package in editable mode; installs the `mathscramble` shim via `uv tool install -e .`; checks the shim dir is on `PATH` and, if not, **prints** the line to add — it does not edit my shell profile.
+2. Verifies/creates the `uv` venv and installs the package in editable mode; installs the `mathscramble` shim via `uv tool install -e .`; checks the shim dir is on `PATH` and, if not, **prints** the line to add — it does not edit the user's shell profile.
 3. Writes `config.toml` from `config.example.toml` if missing.
 4. Starts the private server once to validate, runs `doctor`, lists which model tags are missing with their download sizes, and asks before pulling anything > 30 GB.
 5. Vendors KaTeX into `web/static/` if missing.
@@ -55,15 +54,15 @@ Ollama binary + version (≥ 0.19); global server status on 11434 and its `MAX_L
 ### 2.1 Runtime settings
 - Default footprint ≈ 24 + 65 (+ ~19 if `fast` is separate) GB ≈ 108 GB max. `num_ctx`: 16K for `reasoner`, 8K for `vision`/`fast` unless a problem needs more. Use `-mlx` tags whenever they exist. Use Ollama **structured outputs** (JSON schema) for every data-returning call; parse with Pydantic; on validation failure retry ≤ 3× feeding the error back. Enable thinking: `think=true` on Qwen; `reasoning_effort=high` on gpt-oss for reasoning calls, `low` for cosmetic ones.
 ### 2.2 `--lite` profile (for when ComfyUI or another project is hogging memory)
-`vision = qwen3.6:35b-mlx`, `reasoner = qwen3.8:27b-mlx` (or `qwen3.6:27b-mlx`), `fast = vision`. ≈ 45 GB total. Selectable via `--lite` on any command or `profile = "lite"` in `config.toml`. Bench it too so I know the fidelity cost.
+`vision = qwen3.6:35b-mlx`, `reasoner = qwen3.8:27b-mlx` (or `qwen3.6:27b-mlx`), `fast = vision`. ≈ 45 GB total. Selectable via `--lite` on any command or `profile = "lite"` in `config.toml`. Bench it too so the fidelity cost is known.
 ### 2.3 Benchmark command
-Implement `mathscramble bench` so I can drop any Ollama tag into `config.toml` and get a pass-rate/speed scorecard. Out-of-the-box candidates: `gpt-oss:120b`, `qwen3.5:122b`, `qwen3.8:27b-mlx`, `qwen3.6:35b-mlx`, `glm-5.3-flash`, `gemma4` (largest size that fits).
+Implement `mathscramble bench` so any Ollama tag can be dropped into `config.toml` and get a pass-rate/speed scorecard. Out-of-the-box candidates: `gpt-oss:120b`, `qwen3.5:122b`, `qwen3.8:27b-mlx`, `qwen3.6:35b-mlx`, `glm-5.3-flash`, `gemma4` (largest size that fits).
 ---
 ## 3. What "scrambled but identical" means — the generation algorithm
 Do **not** just ask the model "rewrite this with different numbers" — that yields non-integer answers, impossible triangles, probabilities > 1. Implement the **blueprint approach** (the idea behind the "Computational Blueprints" isomorphic-problem work and GSM-Symbolic-style perturbation):
 ### Step A — Ingest → canonical problem
 - Text/Markdown/LaTeX → one `Problem` record: `{id, source, statement_md, given_answer (optional), tags}`.
-- Images → `vision` returns strict JSON `problems: [{statement_md, diagram_description, answer_if_shown, confidence}]`. One image may hold several problems — split them. All math as LaTeX. `confidence < 0.7` is flagged in the UI for me to fix before scrambling; I can always edit the extraction before generation.
+- Images → `vision` returns strict JSON `problems: [{statement_md, diagram_description, answer_if_shown, confidence}]`. One image may hold several problems — split them. All math as LaTeX. `confidence < 0.7` is flagged in the UI for the user to fix before scrambling; the extraction can always be edited before generation.
 ### Step B — Blueprint extraction (`reasoner`)
 ```
 {
@@ -134,26 +133,26 @@ Single page, follows system dark/light, no login, loopback only.
 - **Input**: drag-and-drop images (multi, thumbnails), textarea for pasted problems (`---` separated), file picker for `.md/.txt/.json`.
 - **Extraction review**: editable Markdown per extracted problem with live KaTeX preview and vision confidence; edit/delete/merge before **Scramble**.
 - **Controls**: variants per problem (1–10), kind override, "keep answer nice", "change scenario" vs "numbers only", seed, model role dropdowns from `/api/tags`, profile (default/lite).
-- **Status strip**: which Ollama server is in use (private:11435 / shared:11434), models resident, free memory — so I can see at a glance that it isn't touching the global server.
+- **Status strip**: which Ollama server is in use (private:11435 / shared:11434), models resident, free memory — so it is visible at a glance that it isn't touching the global server.
 - **Progress**: SSE; per-problem stage (Extracting → Blueprint → Sampling → Verifying ✓/✗, attempt count); current tok/s.
 - **Results**: original vs variant side by side, KaTeX; reveal answer/solution; verification badge; "regenerate this variant"; "show blueprint" (editable → re-run).
 - **Export**: `results.md`, `results.json`, `results.pdf`; copy-one-variant.
 - **History**: sidebar of previous runs from SQLite.
 - Works offline (vendored KaTeX).
 ---
-## 7. Acceptance criteria — show me all of these before calling it done
+## 7. Acceptance criteria — all of these must be demonstrated before the work is called done
 1. `mathscramble setup` then `mathscramble doctor` — all green, and `doctor` explicitly shows the global Ollama on 11434 untouched (its `MAX_LOADED_MODELS` unchanged) while the private server reports `MAX_LOADED_MODELS=3`.
 2. **Non-interference proof:** with MathScrambler's server running and two models resident, run `ollama ps` (global) and show it's unaffected; run `mathscramble server stop` and show only the private PID died. Show `git status`-style evidence that nothing was written outside the repo, `~/Library/Application Support/MathScrambler/`, and the `uv tool` shim dir. Show `grep -i ollama ~/.zshrc ~/.zprofile` unchanged and `launchctl getenv OLLAMA_MAX_LOADED_MODELS` unchanged.
 3. `mathscramble run examples/ -n 3` — ≥ 90% variants pass verification, zero crashes, avg wall time per variant reported.
-4. `mathscramble bench --models gpt-oss:120b,qwen3.5:122b,qwen3.8:27b-mlx` (skip un-pulled ones; tell me pull sizes and wait for OK on anything > 30 GB) — a readable table and a one-paragraph default-`reasoner` recommendation, plus the same table for `--lite`.
-5. Dashboard end to end: upload a photo of a textbook page with 2 problems, fix one extraction typo, 3 variants each, export PDF — while you watch the server log.
+4. `mathscramble bench --models gpt-oss:120b,qwen3.5:122b,qwen3.8:27b-mlx` (skip un-pulled ones; report pull sizes and wait for an OK on anything > 30 GB) — a readable table and a one-paragraph default-`reasoner` recommendation, plus the same table for `--lite`.
+5. Dashboard end to end: upload a photo of a textbook page with 2 problems, fix one extraction typo, 3 variants each, export PDF — while watching the server log.
 6. `pytest` green (non-Ollama tests < 10 s; integration behind `-m ollama`).
 7. `README.md`: install in ≤ 3 commands, both modes, how to swap models, how the isolation works in five sentences, troubleshooting for: Ollama not installed, model not pulled, out of memory / ComfyUI running, port in use.
-Variant quality bar (spot-check 10 and paste them to me): every number changed, every non-math noun changed when "change scenario" is on, identical solution outline, answer computed not guessed, reads like a human wrote it.
+Variant quality bar (spot-check 10 and record them): every number changed, every non-math noun changed when "change scenario" is on, identical solution outline, answer computed not guessed, reads like a human wrote it.
 ---
-## 8. How I want you to work
-- Ask blocking questions **once, up front, in one batch**. Already decided: name, folder, Ollama with a private server on 11435 sharing the model store, `uv`, FastAPI + vanilla JS, SQLite, model roles, zero global side effects.
+## 8. Working method
+- Blocking questions are asked **once, up front, in one batch**. Already decided: name, folder, Ollama with a private server on 11435 sharing the model store, `uv`, FastAPI + vanilla JS, SQLite, model roles, zero global side effects.
 - Build order, checking in after each: (1) `sysinfo` + `ollama_server` + `doctor` + `setup` + `server` commands, with the non-interference proof from criterion 2; (2) `ollama_client` + `models`; (3) ingest incl. vision on the 3 example images; (4) blueprint + sandbox + sampler with unit tests; (5) verify; (6) `run` end to end; (7) dashboard; (8) `bench`; (9) README + polish.
 - Boring, readable code; type hints; `ruff` clean. Fix model misbehaviour in the **prompt file** or **schema**, not with string hacks.
 - If at any point the correct fix seems to require a global change (editing a shell profile, `launchctl setenv`, restarting the user's Ollama, changing `OLLAMA_MODELS`), **stop and ask** — don't do it.
-- Keep `PLAN.md` current: done / next / decisions made without me.
+- Keep `PLAN.md` current: done / next / decisions made without the user.

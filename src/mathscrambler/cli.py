@@ -13,6 +13,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from mathscrambler import __version__, engine, models_cmd, ollama_server, setup_flow
 from mathscrambler import doctor as doctor_mod
@@ -27,7 +28,7 @@ app = typer.Typer(
 server_app = typer.Typer(help="Control the private Ollama server (never touches the global one).")
 app.add_typer(server_app, name="server")
 
-console = Console()
+console = Console(highlight=False)  # prose, not reprs: no auto-colouring of digits and brackets
 
 
 @app.callback(invoke_without_command=True)
@@ -118,6 +119,16 @@ def run(
         f"{summary.variants_total} variants in {summary.wall_s:.0f} s"
         + (f" ({summary.avg_s_per_variant:.0f} s per variant)" if summary.avg_s_per_variant else "")
     )
+    for record in outcome.results.problems:
+        if not record.variants:
+            continue
+        reference = record.original_answer.text if record.original_answer else "?"
+        console.print(f"\n[bold]{record.original.id}[/bold]  [dim]original answer {escape(reference)}[/dim]")
+        for variant in record.variants:
+            statement = " ".join(variant.statement_md.split())
+            console.print(f"  [dim]{variant.index}.[/dim] {escape(statement)}")
+            console.print(f"     [dim]answer[/dim] {escape(variant.answer.text)}")
+    console.print()
     console.print(f"results  {outcome.md_path}")
     console.print(f"         {outcome.json_path}")
     console.print("[dim]the private server stays up for keep_alive; `mathscramble server stop` ends it[/dim]")
