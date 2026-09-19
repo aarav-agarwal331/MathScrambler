@@ -71,6 +71,12 @@ think = false
 # qwen3.8:27b-mlx would be preferred here, but its manifest 412s on this
 # machine's Ollama (0.30.x) — it needs a newer release. Swap it in after an
 # Ollama upgrade if you want; bench keeps it as a candidate and will skip it.
+# KNOWN NOT TO WORK on Ollama 0.30 (2026-09-19): the MLX backend ignores the
+# JSON schema sent as `format`, so blueprint extraction never validates with
+# this tag, thinking on or off. A GGUF tag obeys the schema, but the small one
+# tested (qwen2.5:14b-instruct-q4_K_M) wrote solvers that truncated answers.
+# Until a verification step exists, the default reasoner is the only one shown
+# to produce correct blueprints. See README "Project status".
 [roles.lite.reasoner]
 tag = "qwen3.6:27b-mlx"
 num_ctx = 16384
