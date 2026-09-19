@@ -109,6 +109,7 @@ class StructuredResult[T: BaseModel]:
     value: T
     mode: str  # "direct" | "two_call"
     timings: list[TimingRecord] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)  # validation failures of the attempts before this one
 
 
 # --------------------------------------------------------------------------- family adapter
@@ -341,15 +342,20 @@ class OllamaClient:
         max_retries: int = DEFAULT_MAX_RETRIES,
         images: Sequence[str] | None = None,
         seed: int | None = None,
+        schema: dict | None = None,
     ) -> StructuredResult[M]:
         """A validated `model_cls` instance from `role`, or StructuredCallError.
 
         Tries the tag's cached mode (default: direct schema+thinking). Retries
         feed the validation error back. A direct-mode failure falls back to the
         two-call pattern once and caches the switch.
+
+        `schema` overrides the JSON schema sent as ``format`` — for a caller
+        that needs it stricter than `model_cls` (every property required, say)
+        while still validating the reply against `model_cls`.
         """
         rc = self.roles.resolve(role)
-        schema = model_cls.model_json_schema()
+        schema = model_cls.model_json_schema() if schema is None else schema
         mode = _cached_structured_mode(rc.tag) or "direct"
         errors: list[str] = []
         timings: list[TimingRecord] = []
@@ -362,7 +368,7 @@ class OllamaClient:
             if value is not None:
                 if _cached_structured_mode(rc.tag) is None:
                     _cache_structured_mode(rc.tag, "direct")
-                return StructuredResult(value=value, mode="direct", timings=timings)
+                return StructuredResult(value=value, mode="direct", timings=timings, errors=errors)
 
         value = await self._structured_two_call(
             role, list(messages), model_cls, schema, max_retries, errors, timings,
@@ -371,7 +377,7 @@ class OllamaClient:
         if value is not None:
             if mode == "direct":  # fell back and it worked: remember for this tag
                 _cache_structured_mode(rc.tag, "two_call")
-            return StructuredResult(value=value, mode="two_call", timings=timings)
+            return StructuredResult(value=value, mode="two_call", timings=timings, errors=errors)
         raise StructuredCallError(rc.tag, errors, calls=len(timings))
 
     async def _structured_attempts(

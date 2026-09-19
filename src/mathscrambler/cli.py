@@ -6,14 +6,17 @@ no stubs (SPEC Section 8).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
 
-from mathscrambler import __version__, models_cmd, ollama_server, setup_flow
+from mathscrambler import __version__, engine, models_cmd, ollama_server, setup_flow
 from mathscrambler import doctor as doctor_mod
-from mathscrambler.config import ConfigError, load_config
+from mathscrambler.config import ConfigError, load_config, parse_model_overrides
 
 app = typer.Typer(
     name="mathscramble",
@@ -64,6 +67,61 @@ def models(
     models_cmd.list_models(cfg, console)
     if pull:
         raise typer.Exit(models_cmd.pull_missing(cfg, console, assume_yes=yes))
+
+
+@app.command()
+def run(
+    inputs: Annotated[
+        list[Path],
+        typer.Argument(help="Problem files or folders: .md/.txt/.tex/.json, or images (png/jpg/...)."),
+    ],
+    n: Annotated[int, typer.Option("-n", "--variants", min=1, max=10, help="Variants per problem.")] = 3,
+    out: Annotated[
+        Path | None, typer.Option("--out", help="Output folder (default ./outputs/<timestamp>-<slug>/).")
+    ] = None,
+    seed: Annotated[
+        int | None, typer.Option("--seed", help="Sampling seed; omitted = random, recorded in results.")
+    ] = None,
+    lite: Annotated[
+        bool, typer.Option("--lite", help="Use the lite role profile (smaller reasoner).")
+    ] = False,
+    models: Annotated[
+        str | None,
+        typer.Option(
+            "--models", help="Per-role tag overrides, e.g. reasoner=gpt-oss:120b,vision=qwen2.5vl:7b"
+        ),
+    ] = None,
+) -> None:
+    """Scramble every problem under INPUTS into isomorphic variants (results.json + results.md)."""
+    try:
+        cfg = load_config()
+        options = engine.RunOptions(
+            inputs=list(inputs),
+            n=n,
+            seed=seed,
+            out_dir=out,
+            profile="lite" if lite else None,
+            model_overrides=parse_model_overrides(models),
+        )
+        outcome = asyncio.run(engine.run(cfg, options, console))
+    except (ConfigError, engine.EngineError) as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        console.print(
+            "[yellow]interrupted[/yellow] — the private server is still up; `mathscramble server stop`"
+        )
+        raise typer.Exit(130) from None
+    summary = outcome.results.run
+    console.print(
+        f"done  {summary.problems_ok}/{summary.problems_total} problems scrambled, "
+        f"{summary.variants_total} variants in {summary.wall_s:.0f} s"
+        + (f" ({summary.avg_s_per_variant:.0f} s per variant)" if summary.avg_s_per_variant else "")
+    )
+    console.print(f"results  {outcome.md_path}")
+    console.print(f"         {outcome.json_path}")
+    console.print("[dim]the private server stays up for keep_alive; `mathscramble server stop` ends it[/dim]")
+    raise typer.Exit(0 if summary.problems_ok == summary.problems_total else 2)
 
 
 @server_app.command("start")

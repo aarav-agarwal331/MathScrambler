@@ -1,0 +1,22 @@
+Extract the blueprint of this problem as JSON.
+{% if kind_hint %}
+The author declares this problem's kind as "{{ kind_hint }}".
+{% endif %}
+--- problem statement (Markdown) ---
+{{ statement_md }}
+--- end of statement ---
+{% if diagram_description %}
+The problem came with a figure, described as follows. Fold the measurements a
+solver needs into `template_md` as words; the variants will have no figure.
+
+--- figure ---
+{{ diagram_description }}
+--- end of figure ---
+{% endif %}
+{% if given_answer %}
+The source gives the answer as: {{ given_answer }}
+Your solver must reproduce this value on the original parameters.
+{% else %}
+No answer is given with the source; your solver's result on the original
+parameters is taken as the reference answer, so be exact.
+{% endif %}

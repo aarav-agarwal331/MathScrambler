@@ -1,0 +1,17 @@
+Propose {{ count }} proposals, each replacing every entity below. Give each
+replacement's `slot` as the bare name (`E1`), not the template's `{E1}`.
+
+--- template ---
+{{ template_md }}
+--- end of template ---
+
+Entities:
+{% for entity in entities %}
+- {{ entity.slot }}: "{{ entity.original }}" (role: {{ entity.role }})
+{% endfor %}
+{% if rejected %}
+Your previous proposals were rejected for these reasons; do not repeat them:
+{% for reason in rejected %}
+- {{ reason }}
+{% endfor %}
+{% endif %}
